@@ -15,14 +15,16 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use ed25519_dalek::{Signature, VerifyingKey};
+use p256::{
+    ecdsa::{signature::Verifier, Signature, VerifyingKey},
+    EncodedPoint, PublicKey,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, signal, sync::RwLock, time::interval};
 
-const ED25519_PUBLIC_KEY_HEX_LEN: usize = 64;
-const X25519_PUBLIC_KEY_HEX_LEN: usize = 64;
-const NONCE_HEX_LEN: usize = 48;
+const P256_PUBLIC_KEY_HEX_LEN: usize = 66;
+const NONCE_HEX_LEN: usize = 24;
 const SIGNATURE_HEX_LEN: usize = 128;
 const MESSAGE_TTL: Duration = Duration::from_secs(10 * 60);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
@@ -51,7 +53,6 @@ impl AppState {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct SendMessageRequest {
     from: String,
-    sender_x25519: String,
     nonce: String,
     timestamp_ms: u64,
     ciphertext: String,
@@ -75,7 +76,6 @@ struct SendMessageResponse {
 struct MessageView {
     id: u64,
     from: String,
-    sender_x25519: String,
     nonce: String,
     timestamp_ms: u64,
     ciphertext: String,
@@ -91,7 +91,6 @@ struct ReadMessagesResponse {
 struct StoredMessage {
     id: u64,
     from: String,
-    sender_x25519: String,
     nonce: String,
     timestamp_ms: u64,
     ciphertext: String,
@@ -132,9 +131,8 @@ async fn send_message(
     State(state): State<AppState>,
     Json(payload): Json<SendMessageRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    validate_ed25519_public_key_hex(&recipient, "recipient")?;
-    validate_ed25519_public_key_hex(&payload.from, "from")?;
-    validate_x25519_public_key_hex(&payload.sender_x25519)?;
+    validate_p256_public_key_hex(&recipient, "recipient")?;
+    validate_p256_public_key_hex(&payload.from, "from")?;
     validate_nonce_hex(&payload.nonce)?;
     validate_ciphertext_hex(&payload.ciphertext)?;
     validate_signature_hex(&payload.signature)?;
@@ -143,13 +141,11 @@ async fn send_message(
     let canonical = canonical_send_message(
         &recipient,
         &payload.from,
-        &payload.sender_x25519,
         &payload.nonce,
         payload.timestamp_ms,
         &payload.ciphertext,
     );
-
-    verify_ed25519_signature(&payload.from, canonical.as_bytes(), &payload.signature)?;
+    verify_p256_signature(&payload.from, canonical.as_bytes(), &payload.signature)?;
 
     let replay_key = replay_cache_key("send", &canonical, &payload.signature);
     register_replay_key(
@@ -164,7 +160,6 @@ async fn send_message(
     let message = StoredMessage {
         id: message_id,
         from: payload.from.clone(),
-        sender_x25519: payload.sender_x25519.clone(),
         nonce: payload.nonce.clone(),
         timestamp_ms: payload.timestamp_ms,
         ciphertext: payload.ciphertext.clone(),
@@ -199,13 +194,13 @@ async fn read_messages(
     State(state): State<AppState>,
     Json(payload): Json<ReadMessagesRequest>,
 ) -> Result<Json<ReadMessagesResponse>, ApiError> {
-    validate_ed25519_public_key_hex(&recipient, "recipient")?;
+    validate_p256_public_key_hex(&recipient, "recipient")?;
     validate_nonce_hex(&payload.nonce)?;
     validate_signature_hex(&payload.signature)?;
     validate_fresh_timestamp(payload.timestamp_ms)?;
 
     let canonical = canonical_read_message(&recipient, payload.timestamp_ms, &payload.nonce);
-    verify_ed25519_signature(&recipient, canonical.as_bytes(), &payload.signature)?;
+    verify_p256_signature(&recipient, canonical.as_bytes(), &payload.signature)?;
 
     let replay_key = replay_cache_key("read", &canonical, &payload.signature);
     register_replay_key(
@@ -225,7 +220,6 @@ async fn read_messages(
         .map(|message| MessageView {
             id: message.id,
             from: message.from,
-            sender_x25519: message.sender_x25519,
             nonce: message.nonce,
             timestamp_ms: message.timestamp_ms,
             ciphertext: message.ciphertext,
@@ -291,13 +285,12 @@ fn spawn_cleanup_task(state: AppState) {
 fn canonical_send_message(
     recipient: &str,
     from: &str,
-    sender_x25519: &str,
     nonce: &str,
     timestamp_ms: u64,
     ciphertext: &str,
 ) -> String {
     format!(
-        "unibridge:v1:send\nrecipient={recipient}\nfrom={from}\nsender_x25519={sender_x25519}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\nciphertext={ciphertext}"
+        "unibridge:v1:send\nrecipient={recipient}\nfrom={from}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\nciphertext={ciphertext}"
     )
 }
 
@@ -323,21 +316,13 @@ async fn register_replay_key(
     Ok(())
 }
 
-fn validate_ed25519_public_key_hex(pubkey: &str, field_name: &str) -> Result<(), ApiError> {
-    let key_bytes = decode_fixed_hex(pubkey, ED25519_PUBLIC_KEY_HEX_LEN, field_name)?;
-    let key_array: [u8; 32] = key_bytes
-        .try_into()
-        .map_err(|_| ApiError::bad_request(format!("{field_name} must decode to 32 bytes")))?;
-
-    VerifyingKey::from_bytes(&key_array).map_err(|_| {
-        ApiError::bad_request(format!("{field_name} must be a valid Ed25519 public key"))
+fn validate_p256_public_key_hex(pubkey: &str, field_name: &str) -> Result<(), ApiError> {
+    let key_bytes = decode_fixed_hex(pubkey, P256_PUBLIC_KEY_HEX_LEN, field_name)?;
+    PublicKey::from_sec1_bytes(&key_bytes).map_err(|_| {
+        ApiError::bad_request(format!(
+            "{field_name} must be a valid compressed P-256 SEC1 public key"
+        ))
     })?;
-
-    Ok(())
-}
-
-fn validate_x25519_public_key_hex(pubkey: &str) -> Result<(), ApiError> {
-    decode_fixed_hex(pubkey, X25519_PUBLIC_KEY_HEX_LEN, "sender_x25519")?;
     Ok(())
 }
 
@@ -414,26 +399,26 @@ fn validate_fresh_timestamp(timestamp_ms: u64) -> Result<(), ApiError> {
     }
 }
 
-fn verify_ed25519_signature(
+fn verify_p256_signature(
     pubkey_hex: &str,
     message: &[u8],
     signature_hex: &str,
 ) -> Result<(), ApiError> {
-    let key_bytes = decode_fixed_hex(pubkey_hex, ED25519_PUBLIC_KEY_HEX_LEN, "public key")?;
-    let key_array: [u8; 32] = key_bytes
-        .try_into()
-        .map_err(|_| ApiError::bad_request("public key must decode to 32 bytes"))?;
-    let verifying_key = VerifyingKey::from_bytes(&key_array)
-        .map_err(|_| ApiError::bad_request("public key must be a valid Ed25519 public key"))?;
+    let public_key_bytes = decode_fixed_hex(pubkey_hex, P256_PUBLIC_KEY_HEX_LEN, "public key")?;
+    let public_key = PublicKey::from_sec1_bytes(&public_key_bytes).map_err(|_| {
+        ApiError::bad_request("public key must be a valid compressed P-256 SEC1 public key")
+    })?;
+
+    let verifying_key = VerifyingKey::from_encoded_point(&EncodedPoint::from(public_key))
+        .map_err(|_| ApiError::bad_request("public key must be a valid P-256 verifying key"))?;
 
     let signature_bytes = decode_fixed_hex(signature_hex, SIGNATURE_HEX_LEN, "signature")?;
-    let signature_array: [u8; 64] = signature_bytes
-        .try_into()
-        .map_err(|_| ApiError::bad_request("signature must decode to 64 bytes"))?;
-    let signature = Signature::from_bytes(&signature_array);
+    let signature = Signature::from_slice(&signature_bytes).map_err(|_| {
+        ApiError::bad_request("signature must decode to a 64-byte fixed-width P-256 signature")
+    })?;
 
     verifying_key
-        .verify_strict(message, &signature)
+        .verify(message, &signature)
         .map_err(|_| ApiError::unauthorized("signature verification failed"))
 }
 
@@ -574,28 +559,31 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::{to_bytes, Body};
-    use axum::http::Method;
-    use axum::http::Request;
-    use ed25519_dalek::{Signer, SigningKey};
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Method, Request},
+    };
+    use p256::ecdsa::{signature::Signer, SigningKey};
     use tower::util::ServiceExt;
 
     const MAX_BODY_BYTES: usize = 1024 * 1024;
 
     fn signing_key(seed_byte: u8) -> SigningKey {
-        SigningKey::from_bytes(&[seed_byte; 32])
+        let bytes = [seed_byte; 32];
+        SigningKey::from_bytes((&bytes).into()).unwrap()
     }
 
     fn verifying_key_hex(signing_key: &SigningKey) -> String {
-        hex::encode(signing_key.verifying_key().to_bytes())
-    }
-
-    fn sender_x25519_hex(seed_byte: u8) -> String {
-        hex::encode([seed_byte; 32])
+        hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes(),
+        )
     }
 
     fn nonce_hex(seed_byte: u8) -> String {
-        hex::encode([seed_byte; 24])
+        hex::encode([seed_byte; 12])
     }
 
     fn ciphertext_hex(seed_byte: u8) -> String {
@@ -605,7 +593,6 @@ mod tests {
     fn sign_send_request(
         sender: &SigningKey,
         recipient_hex: &str,
-        sender_x25519: &str,
         nonce: &str,
         timestamp_ms: u64,
         ciphertext: &str,
@@ -613,12 +600,12 @@ mod tests {
         let canonical = canonical_send_message(
             recipient_hex,
             &verifying_key_hex(sender),
-            sender_x25519,
             nonce,
             timestamp_ms,
             ciphertext,
         );
-        hex::encode(sender.sign(canonical.as_bytes()).to_bytes())
+        let signature: Signature = sender.sign(canonical.as_bytes());
+        hex::encode(signature.to_bytes())
     }
 
     fn sign_read_request(
@@ -628,7 +615,14 @@ mod tests {
         nonce: &str,
     ) -> String {
         let canonical = canonical_read_message(recipient_hex, timestamp_ms, nonce);
-        hex::encode(recipient.sign(canonical.as_bytes()).to_bytes())
+        let signature: Signature = recipient.sign(canonical.as_bytes());
+        hex::encode(signature.to_bytes())
+    }
+
+    fn tamper_signature_hex(signature_hex: &str) -> String {
+        let mut bytes = signature_hex.as_bytes().to_vec();
+        bytes[0] = if bytes[0] == b'0' { b'1' } else { b'0' };
+        String::from_utf8(bytes).unwrap()
     }
 
     async fn send_request(router: Router, request: Request<Body>) -> Response {
@@ -651,22 +645,14 @@ mod tests {
         let sender = signing_key(7);
         let recipient_hex = verifying_key_hex(&recipient);
         let sender_hex = verifying_key_hex(&sender);
-        let sender_x25519 = sender_x25519_hex(3);
         let nonce = nonce_hex(5);
         let timestamp_ms = now_unix_ms().unwrap();
         let ciphertext = ciphertext_hex(4);
-        let signature = sign_send_request(
-            &sender,
-            &recipient_hex,
-            &sender_x25519,
-            &nonce,
-            timestamp_ms,
-            &ciphertext,
-        );
+        let signature =
+            sign_send_request(&sender, &recipient_hex, &nonce, timestamp_ms, &ciphertext);
 
         let send_payload = serde_json::json!({
             "from": sender_hex,
-            "sender_x25519": sender_x25519,
             "nonce": nonce,
             "timestamp_ms": timestamp_ms,
             "ciphertext": ciphertext,
@@ -721,15 +707,19 @@ mod tests {
         let sender = signing_key(12);
         let recipient_hex = verifying_key_hex(&recipient);
         let sender_hex = verifying_key_hex(&sender);
-        let sender_x25519 = sender_x25519_hex(13);
         let nonce = nonce_hex(14);
         let timestamp_ms = now_unix_ms().unwrap();
         let ciphertext = ciphertext_hex(15);
-        let signature = hex::encode([0u8; 64]);
+        let signature = tamper_signature_hex(&sign_send_request(
+            &sender,
+            &recipient_hex,
+            &nonce,
+            timestamp_ms,
+            &ciphertext,
+        ));
 
         let payload = serde_json::json!({
             "from": sender_hex,
-            "sender_x25519": sender_x25519,
             "nonce": nonce,
             "timestamp_ms": timestamp_ms,
             "ciphertext": ciphertext,
@@ -762,14 +752,12 @@ mod tests {
         let timestamp_ms = now_unix_ms().unwrap();
         let payload = serde_json::json!({
             "from": sender_hex,
-            "sender_x25519": "xyz",
-            "nonce": nonce_hex(23),
+            "nonce": "xyz",
             "timestamp_ms": timestamp_ms,
             "ciphertext": ciphertext_hex(24),
             "signature": sign_send_request(
                 &sender,
                 &recipient_hex,
-                &sender_x25519_hex(25),
                 &nonce_hex(23),
                 timestamp_ms,
                 &ciphertext_hex(24),
@@ -799,22 +787,14 @@ mod tests {
         let sender = signing_key(32);
         let recipient_hex = verifying_key_hex(&recipient);
         let sender_hex = verifying_key_hex(&sender);
-        let sender_x25519 = sender_x25519_hex(33);
         let nonce = nonce_hex(34);
         let timestamp_ms = now_unix_ms().unwrap() - duration_millis_u64(FRESHNESS_WINDOW) - 1;
         let ciphertext = ciphertext_hex(35);
-        let signature = sign_send_request(
-            &sender,
-            &recipient_hex,
-            &sender_x25519,
-            &nonce,
-            timestamp_ms,
-            &ciphertext,
-        );
+        let signature =
+            sign_send_request(&sender, &recipient_hex, &nonce, timestamp_ms, &ciphertext);
 
         let payload = serde_json::json!({
             "from": sender_hex,
-            "sender_x25519": sender_x25519,
             "nonce": nonce,
             "timestamp_ms": timestamp_ms,
             "ciphertext": ciphertext,
@@ -844,22 +824,14 @@ mod tests {
         let sender = signing_key(42);
         let recipient_hex = verifying_key_hex(&recipient);
         let sender_hex = verifying_key_hex(&sender);
-        let sender_x25519 = sender_x25519_hex(43);
         let nonce = nonce_hex(44);
         let timestamp_ms = now_unix_ms().unwrap();
         let ciphertext = ciphertext_hex(45);
-        let signature = sign_send_request(
-            &sender,
-            &recipient_hex,
-            &sender_x25519,
-            &nonce,
-            timestamp_ms,
-            &ciphertext,
-        );
+        let signature =
+            sign_send_request(&sender, &recipient_hex, &nonce, timestamp_ms, &ciphertext);
 
         let payload = serde_json::json!({
             "from": sender_hex,
-            "sender_x25519": sender_x25519,
             "nonce": nonce,
             "timestamp_ms": timestamp_ms,
             "ciphertext": ciphertext,
@@ -948,7 +920,6 @@ mod tests {
                 vec![StoredMessage {
                     id: 1,
                     from: verifying_key_hex(&signing_key(62)),
-                    sender_x25519: sender_x25519_hex(63),
                     nonce: nonce_hex(64),
                     timestamp_ms: now_unix_ms().unwrap(),
                     ciphertext: ciphertext_hex(65),

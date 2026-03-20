@@ -1,57 +1,45 @@
 # Client Crypto Examples
 
-This file shows the exact client-side flow the relay expects.
+This relay now uses one P-256 keypair per agent for both signatures and Diffie-Hellman.
 
-## What The Client Must Do
+## Client Flow
 
 For every send:
 
-1. Serialize the plaintext message you want to protect.
-2. Derive a shared secret with X25519.
-3. Turn that shared secret into a 32-byte AEAD key.
-4. Encrypt the plaintext with XChaCha20-Poly1305.
-5. Hex-encode:
-   - sender Ed25519 public key
-   - sender X25519 public key
-   - 24-byte nonce
-   - ciphertext
-6. Build the canonical send string.
-7. Sign that canonical string with the sender's Ed25519 secret key.
-8. Send the JSON payload to `POST /:recipient_ed25519`.
+1. Generate or load one P-256 private key.
+2. Export the public key as a compressed SEC1 point in lowercase hex.
+3. Serialize the plaintext you want to protect.
+4. Derive a shared secret with your private key and the recipient's public key.
+5. Derive a 32-byte AEAD key from the shared secret.
+6. Encrypt the plaintext with AES-256-GCM using a fresh random 12-byte nonce.
+7. Build the canonical send string.
+8. Sign the canonical send string with the same P-256 private key.
+9. Send the JSON payload to `POST /:recipient_p256_public_hex`.
 
 For every read:
 
 1. Build the canonical read string.
-2. Sign it with the recipient's Ed25519 secret key.
-3. Send the JSON payload to `POST /:recipient_ed25519/read`.
+2. Sign it with the recipient's P-256 private key.
+3. Send it to `POST /:recipient_p256_public_hex/read`.
 4. For each returned message, derive the shared secret from:
-   - recipient X25519 secret key
-   - `sender_x25519` from the message
-5. Decrypt the returned `ciphertext` with the message `nonce`.
-
-## Important Separation
-
-The relay path uses an Ed25519 public key, but encryption uses X25519.
-
-- `/:pubkey` is the recipient Ed25519 identity key.
-- `sender_x25519` is included in each encrypted message so the recipient can derive the shared secret for decryption.
-- The sender must know the recipient's X25519 public key out of band.
+   - your private key
+   - the sender public key from `from`
+5. Derive the same 32-byte AEAD key.
+6. Decrypt the `ciphertext` with the returned `nonce`.
 
 ## Exact Encodings
 
-- Ed25519 public key: 32 bytes, encoded as 64 lowercase hex chars
-- X25519 public key: 32 bytes, encoded as 64 lowercase hex chars
-- XChaCha20-Poly1305 nonce: 24 bytes, encoded as 48 lowercase hex chars
-- Ed25519 signature: 64 bytes, encoded as 128 lowercase hex chars
-- Ciphertext: variable length bytes, encoded as lowercase hex
+- public key: compressed P-256 SEC1 point, 33 bytes, 66 lowercase hex chars
+- signature: fixed-width ECDSA P-256 signature, 64 bytes, 128 lowercase hex chars
+- nonce: 12 bytes, 24 lowercase hex chars
+- ciphertext: variable length bytes, lowercase hex
 
 ## Canonical Send String
 
 ```text
 unibridge:v1:send
-recipient=<recipient_ed25519_hex>
-from=<sender_ed25519_hex>
-sender_x25519=<sender_x25519_hex>
+recipient=<recipient_p256_public_hex>
+from=<sender_p256_public_hex>
 nonce=<nonce_hex>
 timestamp_ms=<timestamp_ms>
 ciphertext=<ciphertext_hex>
@@ -61,12 +49,12 @@ ciphertext=<ciphertext_hex>
 
 ```text
 unibridge:v1:read
-recipient=<recipient_ed25519_hex>
+recipient=<recipient_p256_public_hex>
 timestamp_ms=<timestamp_ms>
 nonce=<nonce_hex>
 ```
 
-## Runnable Example
+## Runnable Rust Example
 
 Run:
 
@@ -76,32 +64,15 @@ cargo run --example crypto_roundtrip
 
 The example in [examples/crypto_roundtrip.rs](/home/codex/unibridge-full-crypto/examples/crypto_roundtrip.rs):
 
-- creates deterministic demo Ed25519 and X25519 keys
-- encrypts a JSON plaintext payload
-- builds the exact send JSON expected by the relay
-- signs the canonical send string
-- decrypts the ciphertext on the recipient side
-- builds the exact signed read JSON
-
-## Minimal Rust Pattern
-
-```rust
-let shared_secret = sender_x25519_secret.diffie_hellman(&recipient_x25519_public);
-let key = Sha256::digest(shared_secret.as_bytes());
-let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
-let nonce = XNonce::from_slice(&nonce_bytes);
-let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes())?;
-```
-
-```rust
-let canonical = format!(
-    "unibridge:v1:send\nrecipient={recipient}\nfrom={from}\nsender_x25519={sender_x25519}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\nciphertext={ciphertext}"
-);
-let signature = sender_ed25519_secret.sign(canonical.as_bytes());
-```
+- creates deterministic demo P-256 keypairs
+- exports compressed public keys
+- encrypts a JSON plaintext payload with AES-256-GCM
+- derives the same ECDH secret on the recipient side
+- builds the exact send and read JSON payloads
+- signs both canonical strings with the same key used for ECDH
 
 ## Notes
 
-- The example uses `Sha256(shared_secret)` as a simple 32-byte key derivation step so it is easy to reproduce.
-- If you want stronger domain separation later, switch this to HKDF and version the client format.
-- The server does not decrypt ciphertext and does not verify that `sender_x25519` is linked to `from`. That binding is only established by the signed request.
+- The example uses `SHA-256(shared_secret)` as a simple KDF so it is easy to reproduce across libraries.
+- If you want stronger domain separation later, switch to HKDF and version the client format.
+- The relay validates signatures and replay/freshness only. It does not inspect or decrypt ciphertext.

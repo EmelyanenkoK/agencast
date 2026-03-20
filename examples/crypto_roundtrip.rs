@@ -1,29 +1,32 @@
-use chacha20poly1305::{
+use aes_gcm::{
     aead::{Aead, KeyInit},
-    Key, XChaCha20Poly1305, XNonce,
+    Aes256Gcm, Key, Nonce,
 };
-use ed25519_dalek::{Signer, SigningKey};
+use p256::{
+    ecdh::diffie_hellman,
+    ecdsa::{signature::Signer, Signature, SigningKey},
+    PublicKey, SecretKey,
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 fn main() {
-    let sender_identity = SigningKey::from_bytes(&[1u8; 32]);
-    let recipient_identity = SigningKey::from_bytes(&[2u8; 32]);
+    let sender_secret = SecretKey::from_slice(&[1u8; 32]).unwrap();
+    let recipient_secret = SecretKey::from_slice(&[2u8; 32]).unwrap();
 
-    let sender_ed25519_hex = hex::encode(sender_identity.verifying_key().to_bytes());
-    let recipient_ed25519_hex = hex::encode(recipient_identity.verifying_key().to_bytes());
+    let sender_signing_key = SigningKey::from(sender_secret.clone());
+    let recipient_signing_key = SigningKey::from(recipient_secret.clone());
 
-    // Demo-only fixed X25519 secrets so the example is reproducible.
-    // Real clients should generate and persist their own secrets securely.
-    let sender_x25519_secret = StaticSecret::from([3u8; 32]);
-    let recipient_x25519_secret = StaticSecret::from([4u8; 32]);
-    let sender_x25519_public = X25519PublicKey::from(&sender_x25519_secret);
-    let recipient_x25519_public = X25519PublicKey::from(&recipient_x25519_secret);
+    let sender_public_hex = public_key_hex(&sender_signing_key);
+    let recipient_public_hex = public_key_hex(&recipient_signing_key);
 
-    let sender_x25519_hex = hex::encode(sender_x25519_public.as_bytes());
+    let sender_public =
+        PublicKey::from_sec1_bytes(&hex::decode(&sender_public_hex).unwrap()).unwrap();
+    let recipient_public =
+        PublicKey::from_sec1_bytes(&hex::decode(&recipient_public_hex).unwrap()).unwrap();
+
     let timestamp_ms = 1_770_000_000_000u64;
-    let nonce_bytes = [5u8; 24];
+    let nonce_bytes = [5u8; 12];
     let nonce_hex = hex::encode(nonce_bytes);
 
     let plaintext = json!({
@@ -34,30 +37,27 @@ fn main() {
     .to_string();
 
     let ciphertext_hex = encrypt_message(
-        &sender_x25519_secret,
-        &recipient_x25519_public,
+        &sender_secret,
+        &recipient_public,
         &nonce_bytes,
         plaintext.as_bytes(),
     );
 
     let send_canonical = canonical_send_message(
-        &recipient_ed25519_hex,
-        &sender_ed25519_hex,
-        &sender_x25519_hex,
+        &recipient_public_hex,
+        &sender_public_hex,
         &nonce_hex,
         timestamp_ms,
         &ciphertext_hex,
     );
-    let send_signature_hex =
-        hex::encode(sender_identity.sign(send_canonical.as_bytes()).to_bytes());
+    let send_signature: Signature = sender_signing_key.sign(send_canonical.as_bytes());
 
     let send_request = json!({
-        "from": sender_ed25519_hex,
-        "sender_x25519": sender_x25519_hex,
+        "from": sender_public_hex,
         "nonce": nonce_hex,
         "timestamp_ms": timestamp_ms,
         "ciphertext": ciphertext_hex,
-        "signature": send_signature_hex,
+        "signature": hex::encode(send_signature.to_bytes()),
     });
 
     println!("Send JSON:");
@@ -68,20 +68,18 @@ fn main() {
     println!();
 
     let delivered_ciphertext = send_request["ciphertext"].as_str().unwrap();
-    let delivered_sender_x25519 = send_request["sender_x25519"].as_str().unwrap();
-    let delivered_nonce = send_request["nonce"].as_str().unwrap();
-
-    let delivered_sender_x25519_bytes: [u8; 32] = hex::decode(delivered_sender_x25519)
+    let delivered_sender_public =
+        PublicKey::from_sec1_bytes(&hex::decode(send_request["from"].as_str().unwrap()).unwrap())
+            .unwrap();
+    let delivered_nonce: [u8; 12] = hex::decode(send_request["nonce"].as_str().unwrap())
         .unwrap()
         .try_into()
         .unwrap();
-    let delivered_sender_x25519 = X25519PublicKey::from(delivered_sender_x25519_bytes);
-    let delivered_nonce_bytes: [u8; 24] = hex::decode(delivered_nonce).unwrap().try_into().unwrap();
 
     let decrypted = decrypt_message(
-        &recipient_x25519_secret,
-        &delivered_sender_x25519,
-        &delivered_nonce_bytes,
+        &recipient_secret,
+        &delivered_sender_public,
+        &delivered_nonce,
         delivered_ciphertext,
     );
 
@@ -89,16 +87,12 @@ fn main() {
     println!("{decrypted}");
     println!();
 
-    let read_canonical = canonical_read_message(&recipient_ed25519_hex, timestamp_ms, &nonce_hex);
-    let read_signature_hex = hex::encode(
-        recipient_identity
-            .sign(read_canonical.as_bytes())
-            .to_bytes(),
-    );
+    let read_canonical = canonical_read_message(&recipient_public_hex, timestamp_ms, &nonce_hex);
+    let read_signature: Signature = recipient_signing_key.sign(read_canonical.as_bytes());
     let read_request = json!({
         "timestamp_ms": timestamp_ms,
         "nonce": nonce_hex,
-        "signature": read_signature_hex,
+        "signature": hex::encode(read_signature.to_bytes()),
     });
 
     println!("Read JSON:");
@@ -106,51 +100,61 @@ fn main() {
     println!();
     println!("Canonical string signed for read:");
     println!("{read_canonical}");
+
+    let _ = sender_public;
 }
 
 fn encrypt_message(
-    sender_secret: &StaticSecret,
-    recipient_public: &X25519PublicKey,
-    nonce_bytes: &[u8; 24],
+    sender_secret: &SecretKey,
+    recipient_public: &PublicKey,
+    nonce_bytes: &[u8; 12],
     plaintext: &[u8],
 ) -> String {
     let key = derive_aead_key(sender_secret, recipient_public);
-    let cipher = XChaCha20Poly1305::new(&key);
-    let nonce = XNonce::from_slice(nonce_bytes);
+    let cipher = Aes256Gcm::new(&key);
+    let nonce = Nonce::from_slice(nonce_bytes);
     let ciphertext = cipher.encrypt(nonce, plaintext).unwrap();
     hex::encode(ciphertext)
 }
 
 fn decrypt_message(
-    recipient_secret: &StaticSecret,
-    sender_public: &X25519PublicKey,
-    nonce_bytes: &[u8; 24],
+    recipient_secret: &SecretKey,
+    sender_public: &PublicKey,
+    nonce_bytes: &[u8; 12],
     ciphertext_hex: &str,
 ) -> String {
     let key = derive_aead_key(recipient_secret, sender_public);
-    let cipher = XChaCha20Poly1305::new(&key);
-    let nonce = XNonce::from_slice(nonce_bytes);
+    let cipher = Aes256Gcm::new(&key);
+    let nonce = Nonce::from_slice(nonce_bytes);
     let ciphertext = hex::decode(ciphertext_hex).unwrap();
     let plaintext = cipher.decrypt(nonce, ciphertext.as_ref()).unwrap();
     String::from_utf8(plaintext).unwrap()
 }
 
-fn derive_aead_key(secret: &StaticSecret, peer_public: &X25519PublicKey) -> Key {
-    let shared_secret = secret.diffie_hellman(peer_public);
-    let digest = Sha256::digest(shared_secret.as_bytes());
-    *Key::from_slice(&digest)
+fn derive_aead_key(secret: &SecretKey, peer_public: &PublicKey) -> Key<Aes256Gcm> {
+    let shared_secret = diffie_hellman(secret.to_nonzero_scalar(), peer_public.as_affine());
+    let digest = Sha256::digest(shared_secret.raw_secret_bytes());
+    *Key::<Aes256Gcm>::from_slice(&digest)
+}
+
+fn public_key_hex(signing_key: &SigningKey) -> String {
+    hex::encode(
+        signing_key
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes(),
+    )
 }
 
 fn canonical_send_message(
     recipient: &str,
     from: &str,
-    sender_x25519: &str,
     nonce: &str,
     timestamp_ms: u64,
     ciphertext: &str,
 ) -> String {
     format!(
-        "unibridge:v1:send\nrecipient={recipient}\nfrom={from}\nsender_x25519={sender_x25519}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\nciphertext={ciphertext}"
+        "unibridge:v1:send\nrecipient={recipient}\nfrom={from}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\nciphertext={ciphertext}"
     )
 }
 

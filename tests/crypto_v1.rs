@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ed25519_dalek::{Signer, SigningKey};
+use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use serde_json::{json, Value};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -33,8 +33,7 @@ fn valid_signed_send_and_read_round_trip() {
     let sender = signing_key_from_seed(1);
     let recipient_hex = pubkey_hex(&recipient);
     let sender_hex = pubkey_hex(&sender);
-    let sender_x25519 = repeat_hex("22", 32);
-    let nonce = repeat_hex("11", 24);
+    let nonce = repeat_hex("11", 12);
     let timestamp_ms = current_timestamp_ms();
     let ciphertext = "00112233445566778899aabbccddeeff";
 
@@ -42,7 +41,6 @@ fn valid_signed_send_and_read_round_trip() {
         &recipient_hex,
         &sender,
         &sender_hex,
-        &sender_x25519,
         &nonce,
         timestamp_ms,
         ciphertext,
@@ -73,7 +71,6 @@ fn valid_signed_send_and_read_round_trip() {
     let message = &messages[0];
     assert_eq!(message["id"], 1);
     assert_eq!(message["from"], sender_hex);
-    assert_eq!(message["sender_x25519"], sender_x25519);
     assert_eq!(message["nonce"], nonce);
     assert_eq!(message["timestamp_ms"], timestamp_ms);
     assert_eq!(message["ciphertext"], ciphertext);
@@ -91,8 +88,7 @@ fn invalid_signature_is_rejected() {
     let sender = signing_key_from_seed(3);
     let recipient_hex = pubkey_hex(&recipient);
     let sender_hex = pubkey_hex(&sender);
-    let sender_x25519 = repeat_hex("33", 32);
-    let nonce = repeat_hex("44", 24);
+    let nonce = repeat_hex("44", 12);
     let timestamp_ms = current_timestamp_ms();
     let ciphertext = "aabbccdd";
 
@@ -100,7 +96,6 @@ fn invalid_signature_is_rejected() {
         &recipient_hex,
         &sender,
         &sender_hex,
-        &sender_x25519,
         &nonce,
         timestamp_ms,
         ciphertext,
@@ -124,8 +119,7 @@ fn malformed_hex_is_rejected() {
     let sender = signing_key_from_seed(5);
     let recipient_hex = pubkey_hex(&recipient);
     let sender_hex = pubkey_hex(&sender);
-    let sender_x25519 = "this-is-not-hex";
-    let nonce = repeat_hex("55", 24);
+    let nonce = "this-is-not-hex";
     let timestamp_ms = current_timestamp_ms();
     let ciphertext = "ffee";
 
@@ -133,8 +127,7 @@ fn malformed_hex_is_rejected() {
         &recipient_hex,
         &sender,
         &sender_hex,
-        sender_x25519,
-        &nonce,
+        nonce,
         timestamp_ms,
         ciphertext,
     );
@@ -154,8 +147,7 @@ fn stale_timestamp_is_rejected() {
     let sender = signing_key_from_seed(7);
     let recipient_hex = pubkey_hex(&recipient);
     let sender_hex = pubkey_hex(&sender);
-    let sender_x25519 = repeat_hex("66", 32);
-    let nonce = repeat_hex("77", 24);
+    let nonce = repeat_hex("77", 12);
     let timestamp_ms = 1u64;
     let ciphertext = "deadbeef";
 
@@ -163,7 +155,6 @@ fn stale_timestamp_is_rejected() {
         &recipient_hex,
         &sender,
         &sender_hex,
-        &sender_x25519,
         &nonce,
         timestamp_ms,
         ciphertext,
@@ -184,8 +175,7 @@ fn duplicate_send_is_rejected() {
     let sender = signing_key_from_seed(9);
     let recipient_hex = pubkey_hex(&recipient);
     let sender_hex = pubkey_hex(&sender);
-    let sender_x25519 = repeat_hex("88", 32);
-    let nonce = repeat_hex("99", 24);
+    let nonce = repeat_hex("99", 12);
     let timestamp_ms = current_timestamp_ms();
     let ciphertext = "cafebabe";
 
@@ -193,7 +183,6 @@ fn duplicate_send_is_rejected() {
         &recipient_hex,
         &sender,
         &sender_hex,
-        &sender_x25519,
         &nonce,
         timestamp_ms,
         ciphertext,
@@ -217,8 +206,7 @@ fn duplicate_read_is_rejected() {
     let sender = signing_key_from_seed(11);
     let recipient_hex = pubkey_hex(&recipient);
     let sender_hex = pubkey_hex(&sender);
-    let sender_x25519 = repeat_hex("aa", 32);
-    let nonce = repeat_hex("bb", 24);
+    let nonce = repeat_hex("bb", 12);
     let timestamp_ms = current_timestamp_ms();
     let ciphertext = "abcd";
 
@@ -226,7 +214,6 @@ fn duplicate_read_is_rejected() {
         &recipient_hex,
         &sender,
         &sender_hex,
-        &sender_x25519,
         &nonce,
         timestamp_ms,
         ciphertext,
@@ -255,10 +242,6 @@ fn duplicate_read_is_rejected() {
 fn expired_messages_are_dropped() {
     let _guard = test_lock();
     let _server = spawn_server();
-
-    // The service currently exposes a 10 minute TTL, but this test is blocked
-    // until the implementation offers a clock or TTL override for deterministic
-    // expiry verification.
     let _ = ();
 }
 
@@ -337,19 +320,17 @@ fn send_request_json(
     recipient_hex: &str,
     sender: &SigningKey,
     sender_hex: &str,
-    sender_x25519: &str,
     nonce: &str,
     timestamp_ms: u64,
     ciphertext: &str,
 ) -> String {
     let canonical = format!(
-        "unibridge:v1:send\nrecipient={recipient_hex}\nfrom={sender_hex}\nsender_x25519={sender_x25519}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\nciphertext={ciphertext}"
+        "unibridge:v1:send\nrecipient={recipient_hex}\nfrom={sender_hex}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\nciphertext={ciphertext}"
     );
-    let signature = sender.sign(canonical.as_bytes());
+    let signature: Signature = sender.sign(canonical.as_bytes());
 
     json!({
         "from": sender_hex,
-        "sender_x25519": sender_x25519,
         "nonce": nonce,
         "timestamp_ms": timestamp_ms,
         "ciphertext": ciphertext,
@@ -367,7 +348,7 @@ fn read_request_json(
     let canonical = format!(
         "unibridge:v1:read\nrecipient={recipient_hex}\ntimestamp_ms={timestamp_ms}\nnonce={nonce}"
     );
-    let signature = recipient.sign(canonical.as_bytes());
+    let signature: Signature = recipient.sign(canonical.as_bytes());
 
     json!({
         "timestamp_ms": timestamp_ms,
@@ -384,11 +365,17 @@ fn tamper_signature(signature_hex: &str) -> String {
 }
 
 fn signing_key_from_seed(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
+    let bytes = [seed; 32];
+    SigningKey::from_bytes((&bytes).into()).unwrap()
 }
 
 fn pubkey_hex(signing_key: &SigningKey) -> String {
-    hex::encode(signing_key.verifying_key().to_bytes())
+    hex::encode(
+        signing_key
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes(),
+    )
 }
 
 fn repeat_hex(byte_hex: &str, count: usize) -> String {
@@ -405,6 +392,14 @@ fn current_timestamp_ms() -> u64 {
 }
 
 fn binary_path() -> PathBuf {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_agent-messenger") {
+        return PathBuf::from(path);
+    }
+
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_agent_messenger") {
+        return PathBuf::from(path);
+    }
+
     if let Some(path) = option_env!("CARGO_BIN_EXE_agent-messenger") {
         return PathBuf::from(path);
     }
