@@ -1,4 +1,4 @@
-# Unibridge P-256 Execution Plan
+# Agencast P-256 Execution Plan
 
 ## Goal
 
@@ -47,7 +47,7 @@ Keep the relay behavior the same:
 ### Canonical Send String
 
 ```text
-unibridge:v1:send
+agencast:v1:send
 recipient=<recipient_p256_public_hex>
 from=<sender_p256_public_hex>
 nonce=<nonce_hex>
@@ -58,7 +58,7 @@ ciphertext=<ciphertext_hex>
 ### Canonical Read String
 
 ```text
-unibridge:v1:read
+agencast:v1:read
 recipient=<recipient_p256_public_hex>
 timestamp_ms=<timestamp_ms>
 nonce=<nonce_hex>

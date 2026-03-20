@@ -54,7 +54,9 @@ fn valid_signed_send_and_read_round_trip() {
 
     let send_json: Value = serde_json::from_str(&send_response.body).unwrap();
     assert_eq!(send_json["status"], "queued");
-    assert_eq!(send_json["message_id"], 1);
+    let message_id = send_json["message_id"]
+        .as_u64()
+        .expect("send response message_id");
 
     let read_body = read_request_json(&recipient_hex, &recipient, &nonce, timestamp_ms);
     let read_response = post_json(&format!("/{recipient_hex}/read"), &read_body);
@@ -69,7 +71,7 @@ fn valid_signed_send_and_read_round_trip() {
     assert_eq!(messages.len(), 1);
 
     let message = &messages[0];
-    assert_eq!(message["id"], 1);
+    assert_eq!(message["id"].as_u64(), Some(message_id));
     assert_eq!(message["from"], sender_hex);
     assert_eq!(message["nonce"], nonce);
     assert_eq!(message["timestamp_ms"], timestamp_ms);
@@ -193,6 +195,34 @@ fn duplicate_send_is_rejected() {
 
     let second = post_json(&format!("/{recipient_hex}"), &body);
     assert_eq!(second.status, 409, "duplicate send: {}", second.body);
+
+    drop(server);
+}
+
+#[test]
+fn oversized_ciphertext_is_rejected() {
+    let _guard = test_lock();
+    let server = spawn_server();
+
+    let recipient = signing_key_from_seed(14);
+    let sender = signing_key_from_seed(13);
+    let recipient_hex = pubkey_hex(&recipient);
+    let sender_hex = pubkey_hex(&sender);
+    let nonce = repeat_hex("cc", 12);
+    let timestamp_ms = current_timestamp_ms();
+    let ciphertext = "ab".repeat(4097);
+
+    let body = send_request_json(
+        &recipient_hex,
+        &sender,
+        &sender_hex,
+        &nonce,
+        timestamp_ms,
+        &ciphertext,
+    );
+
+    let response = post_json(&format!("/{recipient_hex}"), &body);
+    assert_eq!(response.status, 400, "response: {}", response.body);
 
     drop(server);
 }
@@ -325,7 +355,7 @@ fn send_request_json(
     ciphertext: &str,
 ) -> String {
     let canonical = format!(
-        "unibridge:v1:send\nrecipient={recipient_hex}\nfrom={sender_hex}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\nciphertext={ciphertext}"
+        "agencast:v1:send\nrecipient={recipient_hex}\nfrom={sender_hex}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\nciphertext={ciphertext}"
     );
     let signature: Signature = sender.sign(canonical.as_bytes());
 
@@ -346,7 +376,7 @@ fn read_request_json(
     timestamp_ms: u64,
 ) -> String {
     let canonical = format!(
-        "unibridge:v1:read\nrecipient={recipient_hex}\ntimestamp_ms={timestamp_ms}\nnonce={nonce}"
+        "agencast:v1:read\nrecipient={recipient_hex}\ntimestamp_ms={timestamp_ms}\nnonce={nonce}"
     );
     let signature: Signature = recipient.sign(canonical.as_bytes());
 

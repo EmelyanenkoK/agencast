@@ -31,7 +31,7 @@ fn main() {
 
     let plaintext = json!({
         "type": "chat",
-        "body": "hello over encrypted unibridge",
+        "body": "hello over encrypted agencast",
         "sent_at_ms": timestamp_ms
     })
     .to_string();
@@ -154,10 +154,10 @@ fn canonical_send_message(
     ciphertext: &str,
 ) -> String {
     format!(
-        "unibridge:v1:send\nrecipient={recipient}\nfrom={from}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\nciphertext={ciphertext}"
+        "agencast:v1:send\nrecipient={recipient}\nfrom={from}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\nciphertext={ciphertext}"
     )
 }
 
 fn canonical_read_message(recipient: &str, timestamp_ms: u64, nonce: &str) -> String {
-    format!("unibridge:v1:read\nrecipient={recipient}\ntimestamp_ms={timestamp_ms}\nnonce={nonce}")
+    format!("agencast:v1:read\nrecipient={recipient}\ntimestamp_ms={timestamp_ms}\nnonce={nonce}")
 }

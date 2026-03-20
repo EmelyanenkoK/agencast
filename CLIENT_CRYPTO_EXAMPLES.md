@@ -34,10 +34,14 @@ For every read:
 - nonce: 12 bytes, 24 lowercase hex chars
 - ciphertext: variable length bytes, lowercase hex
 
+Ciphertext limit:
+
+- maximum ciphertext size per message is 4 KiB
+
 ## Canonical Send String
 
 ```text
-unibridge:v1:send
+agencast:v1:send
 recipient=<recipient_p256_public_hex>
 from=<sender_p256_public_hex>
 nonce=<nonce_hex>
@@ -48,7 +52,7 @@ ciphertext=<ciphertext_hex>
 ## Canonical Read String
 
 ```text
-unibridge:v1:read
+agencast:v1:read
 recipient=<recipient_p256_public_hex>
 timestamp_ms=<timestamp_ms>
 nonce=<nonce_hex>

@@ -9,10 +9,11 @@ use std::{
 };
 
 use axum::{
+    extract::rejection::JsonRejection,
     extract::{Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::get,
     Json, Router,
 };
 use p256::{
@@ -26,10 +27,12 @@ use tokio::{net::TcpListener, signal, sync::RwLock, time::interval};
 const P256_PUBLIC_KEY_HEX_LEN: usize = 66;
 const NONCE_HEX_LEN: usize = 24;
 const SIGNATURE_HEX_LEN: usize = 128;
+const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 const MESSAGE_TTL: Duration = Duration::from_secs(10 * 60);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 const FRESHNESS_WINDOW: Duration = Duration::from_secs(5 * 60);
-const SKILL_TEXT: &str = include_str!("../skill/unibridge/SKILL.md");
+const SKILL_TEXT: &str = include_str!("../skill/agencast/SKILL.md");
+const DOCS_PATH: &str = "/";
 
 #[derive(Clone)]
 struct AppState {
@@ -120,8 +123,8 @@ async fn main() {
 
 fn build_router(state: AppState) -> Router {
     Router::new()
-        .route("/:pubkey", post(send_message))
-        .route("/:pubkey/read", post(read_messages))
+        .route("/:pubkey", get(help_handler).post(send_message))
+        .route("/:pubkey/read", get(help_handler).post(read_messages))
         .fallback(fallback_handler)
         .with_state(state)
 }
@@ -129,8 +132,9 @@ fn build_router(state: AppState) -> Router {
 async fn send_message(
     Path(recipient): Path<String>,
     State(state): State<AppState>,
-    Json(payload): Json<SendMessageRequest>,
+    payload: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let Json(payload) = payload.map_err(api_error_from_json_rejection)?;
     validate_p256_public_key_hex(&recipient, "recipient")?;
     validate_p256_public_key_hex(&payload.from, "from")?;
     validate_nonce_hex(&payload.nonce)?;
@@ -192,8 +196,9 @@ async fn send_message(
 async fn read_messages(
     Path(recipient): Path<String>,
     State(state): State<AppState>,
-    Json(payload): Json<ReadMessagesRequest>,
+    payload: Result<Json<ReadMessagesRequest>, JsonRejection>,
 ) -> Result<Json<ReadMessagesResponse>, ApiError> {
+    let Json(payload) = payload.map_err(api_error_from_json_rejection)?;
     validate_p256_public_key_hex(&recipient, "recipient")?;
     validate_nonce_hex(&payload.nonce)?;
     validate_signature_hex(&payload.signature)?;
@@ -239,6 +244,14 @@ async fn read_messages(
 }
 
 async fn fallback_handler() -> impl IntoResponse {
+    help_response()
+}
+
+async fn help_handler() -> impl IntoResponse {
+    help_response()
+}
+
+fn help_response() -> impl IntoResponse {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -290,12 +303,12 @@ fn canonical_send_message(
     ciphertext: &str,
 ) -> String {
     format!(
-        "unibridge:v1:send\nrecipient={recipient}\nfrom={from}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\nciphertext={ciphertext}"
+        "agencast:v1:send\nrecipient={recipient}\nfrom={from}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\nciphertext={ciphertext}"
     )
 }
 
 fn canonical_read_message(recipient: &str, timestamp_ms: u64, nonce: &str) -> String {
-    format!("unibridge:v1:read\nrecipient={recipient}\ntimestamp_ms={timestamp_ms}\nnonce={nonce}")
+    format!("agencast:v1:read\nrecipient={recipient}\ntimestamp_ms={timestamp_ms}\nnonce={nonce}")
 }
 
 async fn register_replay_key(
@@ -348,8 +361,14 @@ fn validate_ciphertext_hex(ciphertext: &str) -> Result<(), ApiError> {
         ));
     }
 
-    hex::decode(ciphertext)
+    let ciphertext_bytes = hex::decode(ciphertext)
         .map_err(|_| ApiError::bad_request("ciphertext must be valid lowercase hexadecimal"))?;
+
+    if ciphertext_bytes.len() > MAX_MESSAGE_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "ciphertext must not exceed {MAX_MESSAGE_BYTES} bytes"
+        )));
+    }
 
     Ok(())
 }
@@ -550,10 +569,19 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = Json(serde_json::json!({
             "error": self.message,
+            "docs": DOCS_PATH,
+            "hint": "See GET / for protocol documentation and request examples.",
         }));
 
         (self.status, body).into_response()
     }
+}
+
+fn api_error_from_json_rejection(rejection: JsonRejection) -> ApiError {
+    ApiError::bad_request(format!(
+        "invalid JSON request body: {}",
+        rejection.body_text()
+    ))
 }
 
 #[cfg(test)]
@@ -634,6 +662,13 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn response_text(response: Response) -> String {
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
     }
 
     #[tokio::test]
@@ -738,6 +773,8 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let json = response_json(response).await;
+        assert_eq!(json["docs"], DOCS_PATH);
     }
 
     #[tokio::test]
@@ -776,6 +813,8 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["docs"], DOCS_PATH);
     }
 
     #[tokio::test]
@@ -813,6 +852,47 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["docs"], DOCS_PATH);
+    }
+
+    #[tokio::test]
+    async fn oversized_ciphertext_is_rejected() {
+        let state = AppState::new();
+        let router = build_router(state);
+
+        let recipient = signing_key(36);
+        let sender = signing_key(37);
+        let recipient_hex = verifying_key_hex(&recipient);
+        let sender_hex = verifying_key_hex(&sender);
+        let nonce = nonce_hex(38);
+        let timestamp_ms = now_unix_ms().unwrap();
+        let ciphertext = hex::encode(vec![0x42; MAX_MESSAGE_BYTES + 1]);
+        let signature =
+            sign_send_request(&sender, &recipient_hex, &nonce, timestamp_ms, &ciphertext);
+
+        let payload = serde_json::json!({
+            "from": sender_hex,
+            "nonce": nonce,
+            "timestamp_ms": timestamp_ms,
+            "ciphertext": ciphertext,
+            "signature": signature,
+        });
+
+        let response = send_request(
+            router,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["docs"], DOCS_PATH);
     }
 
     #[tokio::test]
@@ -862,6 +942,8 @@ mod tests {
         )
         .await;
         assert_eq!(second.status(), StatusCode::CONFLICT);
+        let json = response_json(second).await;
+        assert_eq!(json["docs"], DOCS_PATH);
     }
 
     #[tokio::test]
@@ -905,6 +987,8 @@ mod tests {
         )
         .await;
         assert_eq!(second.status(), StatusCode::CONFLICT);
+        let json = response_json(second).await;
+        assert_eq!(json["docs"], DOCS_PATH);
     }
 
     #[tokio::test]
@@ -953,5 +1037,66 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
         assert_eq!(json["messages"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_keyed_paths_render_help_text() {
+        let state = AppState::new();
+        let router = build_router(state);
+        let pubkey = verifying_key_hex(&signing_key(71));
+
+        let response = send_request(
+            router.clone(),
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/{pubkey}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("## Security"));
+
+        let read_response = send_request(
+            router,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/{pubkey}/read"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(read_response.status(), StatusCode::OK);
+        let read_body = response_text(read_response).await;
+        assert!(read_body.contains("## Exact Payload Shape"));
+    }
+
+    #[tokio::test]
+    async fn malformed_json_includes_docs_pointer() {
+        let state = AppState::new();
+        let router = build_router(state);
+        let recipient_hex = verifying_key_hex(&signing_key(72));
+
+        let response = send_request(
+            router,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["docs"], DOCS_PATH);
+        assert_eq!(
+            json["hint"],
+            "See GET / for protocol documentation and request examples."
+        );
     }
 }

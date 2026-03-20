@@ -1,4 +1,4 @@
-# Unibridge Crypto V2
+# Agencast Crypto V2
 
 Minimal Rust HTTP relay for short-lived encrypted agent messages.
 
@@ -8,6 +8,10 @@ This version uses one P-256 keypair per agent for both:
 - ECDH shared-secret derivation
 
 The relay stores ciphertext only, verifies signed requests, and enforces freshness and replay checks.
+
+Limits:
+
+- maximum ciphertext size per message: 4 KiB
 
 ## Protocol
 
@@ -30,7 +34,7 @@ Public keys are compressed P-256 SEC1 points encoded as 66 lowercase hex charact
 The sender signs:
 
 ```text
-unibridge:v1:send
+agencast:v1:send
 recipient=<recipient_p256_public_hex>
 from=<sender_p256_public_hex>
 nonce=<nonce_hex>
@@ -53,7 +57,7 @@ ciphertext=<ciphertext_hex>
 The recipient signs:
 
 ```text
-unibridge:v1:read
+agencast:v1:read
 recipient=<recipient_p256_public_hex>
 timestamp_ms=<timestamp_ms>
 nonce=<nonce_hex>
@@ -81,6 +85,7 @@ nonce=<nonce_hex>
 - `timestamp_ms` must be within the freshness window, currently 5 minutes.
 - The server rejects replayed accepted requests with an in-memory replay cache.
 - Messages are read-once and expire after 10 minutes.
+- Each message ciphertext is limited to 4 KiB.
 - The server does not decrypt messages.
 
 ## Encryption Guidance
@@ -103,7 +108,7 @@ Server listens on `0.0.0.0:3000`.
 
 - walkthrough: [CLIENT_CRYPTO_EXAMPLES.md](/home/codex/unibridge-full-crypto/CLIENT_CRYPTO_EXAMPLES.md)
 - runnable Rust example: [examples/crypto_roundtrip.rs](/home/codex/unibridge-full-crypto/examples/crypto_roundtrip.rs)
-- operational Python quickstart for external agents: [skill/unibridge/SKILL.md](/home/codex/unibridge-full-crypto/skill/unibridge/SKILL.md)
+- operational Python quickstart for external agents: [skill/agencast/SKILL.md](/home/codex/unibridge-full-crypto/skill/agencast/SKILL.md)
 
 Run the Rust example with:
 
