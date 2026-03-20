@@ -15,24 +15,54 @@ use axum::{
     routing::post,
     Json, Router,
 };
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, signal, sync::RwLock, time::interval};
 
-const PUBKEY_LEN: usize = 64;
+const ED25519_PUBLIC_KEY_HEX_LEN: usize = 64;
+const X25519_PUBLIC_KEY_HEX_LEN: usize = 64;
+const NONCE_HEX_LEN: usize = 48;
+const SIGNATURE_HEX_LEN: usize = 128;
 const MESSAGE_TTL: Duration = Duration::from_secs(10 * 60);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+const FRESHNESS_WINDOW: Duration = Duration::from_secs(5 * 60);
 const SKILL_TEXT: &str = include_str!("../skill/unibridge/SKILL.md");
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<RwLock<HashMap<String, Vec<StoredMessage>>>>,
+    send_replay_cache: Arc<RwLock<HashMap<String, Instant>>>,
+    read_replay_cache: Arc<RwLock<HashMap<String, Instant>>>,
     next_message_id: Arc<AtomicU64>,
 }
 
-#[derive(Debug, Deserialize)]
+impl AppState {
+    fn new() -> Self {
+        Self {
+            store: Arc::new(RwLock::new(HashMap::new())),
+            send_replay_cache: Arc::new(RwLock::new(HashMap::new())),
+            read_replay_cache: Arc::new(RwLock::new(HashMap::new())),
+            next_message_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct SendMessageRequest {
     from: String,
-    body: String,
+    sender_x25519: String,
+    nonce: String,
+    timestamp_ms: u64,
+    ciphertext: String,
+    signature: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct ReadMessagesRequest {
+    timestamp_ms: u64,
+    nonce: String,
+    signature: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,7 +75,10 @@ struct SendMessageResponse {
 struct MessageView {
     id: u64,
     from: String,
-    body: String,
+    sender_x25519: String,
+    nonce: String,
+    timestamp_ms: u64,
+    ciphertext: String,
     received_at_unix: u64,
 }
 
@@ -54,29 +87,24 @@ struct ReadMessagesResponse {
     messages: Vec<MessageView>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct StoredMessage {
     id: u64,
     from: String,
-    body: String,
+    sender_x25519: String,
+    nonce: String,
+    timestamp_ms: u64,
+    ciphertext: String,
     received_at: SystemTime,
     expires_at: Instant,
 }
 
 #[tokio::main]
 async fn main() {
-    let state = AppState {
-        store: Arc::new(RwLock::new(HashMap::new())),
-        next_message_id: Arc::new(AtomicU64::new(1)),
-    };
-
+    let state = AppState::new();
     spawn_cleanup_task(state.clone());
 
-    let app = Router::new()
-        .route("/:pubkey", post(send_message))
-        .route("/:pubkey/read", post(read_messages))
-        .fallback(fallback_handler)
-        .with_state(state);
+    let app = build_router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     let listener = TcpListener::bind(addr)
@@ -91,22 +119,55 @@ async fn main() {
         .expect("server error");
 }
 
+fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/:pubkey", post(send_message))
+        .route("/:pubkey/read", post(read_messages))
+        .fallback(fallback_handler)
+        .with_state(state)
+}
+
 async fn send_message(
     Path(recipient): Path<String>,
     State(state): State<AppState>,
     Json(payload): Json<SendMessageRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    validate_pubkey(&recipient)?;
-    validate_pubkey(&payload.from)?;
+    validate_ed25519_public_key_hex(&recipient, "recipient")?;
+    validate_ed25519_public_key_hex(&payload.from, "from")?;
+    validate_x25519_public_key_hex(&payload.sender_x25519)?;
+    validate_nonce_hex(&payload.nonce)?;
+    validate_ciphertext_hex(&payload.ciphertext)?;
+    validate_signature_hex(&payload.signature)?;
+    validate_fresh_timestamp(payload.timestamp_ms)?;
+
+    let canonical = canonical_send_message(
+        &recipient,
+        &payload.from,
+        &payload.sender_x25519,
+        &payload.nonce,
+        payload.timestamp_ms,
+        &payload.ciphertext,
+    );
+
+    verify_ed25519_signature(&payload.from, canonical.as_bytes(), &payload.signature)?;
+
+    let replay_key = replay_cache_key("send", &canonical, &payload.signature);
+    register_replay_key(
+        &state.send_replay_cache,
+        replay_key,
+        Instant::now() + FRESHNESS_WINDOW,
+    )
+    .await?;
 
     let recipient_for_log = recipient.clone();
-    let from = payload.from;
-    let body = payload.body;
     let message_id = state.next_message_id.fetch_add(1, Ordering::Relaxed);
     let message = StoredMessage {
         id: message_id,
-        from: from.clone(),
-        body: body.clone(),
+        from: payload.from.clone(),
+        sender_x25519: payload.sender_x25519.clone(),
+        nonce: payload.nonce.clone(),
+        timestamp_ms: payload.timestamp_ms,
+        ciphertext: payload.ciphertext.clone(),
         received_at: SystemTime::now(),
         expires_at: Instant::now() + MESSAGE_TTL,
     };
@@ -118,9 +179,10 @@ async fn send_message(
     let queue_len = queue.len();
 
     println!(
-        "queued message id={message_id} from={from} to={} queue_len={queue_len} expired_removed={expired_removed} body={}",
+        "queued encrypted message id={message_id} from={} to={} queue_len={queue_len} expired_removed={expired_removed} ciphertext={}",
+        payload.from,
         recipient_for_log,
-        format_message_for_log(&body),
+        format_hex_preview(&payload.ciphertext),
     );
 
     Ok((
@@ -135,14 +197,26 @@ async fn send_message(
 async fn read_messages(
     Path(recipient): Path<String>,
     State(state): State<AppState>,
+    Json(payload): Json<ReadMessagesRequest>,
 ) -> Result<Json<ReadMessagesResponse>, ApiError> {
-    validate_pubkey(&recipient)?;
+    validate_ed25519_public_key_hex(&recipient, "recipient")?;
+    validate_nonce_hex(&payload.nonce)?;
+    validate_signature_hex(&payload.signature)?;
+    validate_fresh_timestamp(payload.timestamp_ms)?;
+
+    let canonical = canonical_read_message(&recipient, payload.timestamp_ms, &payload.nonce);
+    verify_ed25519_signature(&recipient, canonical.as_bytes(), &payload.signature)?;
+
+    let replay_key = replay_cache_key("read", &canonical, &payload.signature);
+    register_replay_key(
+        &state.read_replay_cache,
+        replay_key,
+        Instant::now() + FRESHNESS_WINDOW,
+    )
+    .await?;
 
     let mut store = state.store.write().await;
-    let messages = match store.remove(&recipient) {
-        Some(messages) => messages,
-        None => Vec::new(),
-    };
+    let messages = store.remove(&recipient).unwrap_or_default();
 
     let total_messages = messages.len();
     let unread: Vec<_> = messages
@@ -151,7 +225,10 @@ async fn read_messages(
         .map(|message| MessageView {
             id: message.id,
             from: message.from,
-            body: message.body,
+            sender_x25519: message.sender_x25519,
+            nonce: message.nonce,
+            timestamp_ms: message.timestamp_ms,
+            ciphertext: message.ciphertext,
             received_at_unix: message
                 .received_at
                 .duration_since(UNIX_EPOCH)
@@ -182,38 +259,192 @@ fn spawn_cleanup_task(state: AppState) {
         loop {
             ticker.tick().await;
 
-            let mut store = state.store.write().await;
-            let mut expired_removed = 0usize;
-            store.retain(|_, messages| {
-                expired_removed += count_expired_messages(messages);
-                retain_unexpired_messages(messages);
-                !messages.is_empty()
-            });
+            let expired_messages = {
+                let mut store = state.store.write().await;
+                let mut expired_removed = 0usize;
+                store.retain(|_, messages| {
+                    expired_removed += retain_unexpired_messages(messages);
+                    !messages.is_empty()
+                });
+                expired_removed
+            };
 
-            if expired_removed > 0 {
-                println!("cleanup removed expired_messages={expired_removed}");
+            let expired_send_replays = {
+                let mut cache = state.send_replay_cache.write().await;
+                retain_unexpired_replay_entries(&mut cache)
+            };
+
+            let expired_read_replays = {
+                let mut cache = state.read_replay_cache.write().await;
+                retain_unexpired_replay_entries(&mut cache)
+            };
+
+            if expired_messages > 0 || expired_send_replays > 0 || expired_read_replays > 0 {
+                println!(
+                    "cleanup removed expired_messages={expired_messages} expired_send_replays={expired_send_replays} expired_read_replays={expired_read_replays}"
+                );
             }
         }
     });
 }
 
-fn validate_pubkey(pubkey: &str) -> Result<(), ApiError> {
-    let is_valid = pubkey.len() == PUBKEY_LEN
-        && pubkey
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+fn canonical_send_message(
+    recipient: &str,
+    from: &str,
+    sender_x25519: &str,
+    nonce: &str,
+    timestamp_ms: u64,
+    ciphertext: &str,
+) -> String {
+    format!(
+        "unibridge:v1:send\nrecipient={recipient}\nfrom={from}\nsender_x25519={sender_x25519}\nnonce={nonce}\ntimestamp_ms={timestamp_ms}\nciphertext={ciphertext}"
+    )
+}
+
+fn canonical_read_message(recipient: &str, timestamp_ms: u64, nonce: &str) -> String {
+    format!("unibridge:v1:read\nrecipient={recipient}\ntimestamp_ms={timestamp_ms}\nnonce={nonce}")
+}
+
+async fn register_replay_key(
+    cache: &Arc<RwLock<HashMap<String, Instant>>>,
+    replay_key: String,
+    expires_at: Instant,
+) -> Result<(), ApiError> {
+    let mut cache = cache.write().await;
+    retain_expired_replay_entries(&mut cache);
+
+    if cache.contains_key(&replay_key) {
+        return Err(ApiError::conflict(
+            "duplicate request rejected by replay protection",
+        ));
+    }
+
+    cache.insert(replay_key, expires_at);
+    Ok(())
+}
+
+fn validate_ed25519_public_key_hex(pubkey: &str, field_name: &str) -> Result<(), ApiError> {
+    let key_bytes = decode_fixed_hex(pubkey, ED25519_PUBLIC_KEY_HEX_LEN, field_name)?;
+    let key_array: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| ApiError::bad_request(format!("{field_name} must decode to 32 bytes")))?;
+
+    VerifyingKey::from_bytes(&key_array).map_err(|_| {
+        ApiError::bad_request(format!("{field_name} must be a valid Ed25519 public key"))
+    })?;
+
+    Ok(())
+}
+
+fn validate_x25519_public_key_hex(pubkey: &str) -> Result<(), ApiError> {
+    decode_fixed_hex(pubkey, X25519_PUBLIC_KEY_HEX_LEN, "sender_x25519")?;
+    Ok(())
+}
+
+fn validate_nonce_hex(nonce: &str) -> Result<(), ApiError> {
+    decode_fixed_hex(nonce, NONCE_HEX_LEN, "nonce")?;
+    Ok(())
+}
+
+fn validate_signature_hex(signature: &str) -> Result<(), ApiError> {
+    decode_fixed_hex(signature, SIGNATURE_HEX_LEN, "signature")?;
+    Ok(())
+}
+
+fn validate_ciphertext_hex(ciphertext: &str) -> Result<(), ApiError> {
+    if ciphertext.is_empty() {
+        return Err(ApiError::bad_request("ciphertext must not be empty"));
+    }
+
+    validate_lower_hex(ciphertext, "ciphertext")?;
+    if !ciphertext.len().is_multiple_of(2) {
+        return Err(ApiError::bad_request(
+            "ciphertext must contain an even number of hex characters",
+        ));
+    }
+
+    hex::decode(ciphertext)
+        .map_err(|_| ApiError::bad_request("ciphertext must be valid lowercase hexadecimal"))?;
+
+    Ok(())
+}
+
+fn decode_fixed_hex(
+    input: &str,
+    expected_hex_len: usize,
+    field_name: &str,
+) -> Result<Vec<u8>, ApiError> {
+    if input.len() != expected_hex_len {
+        return Err(ApiError::bad_request(format!(
+            "{field_name} must be exactly {expected_hex_len} lowercase hexadecimal characters"
+        )));
+    }
+
+    validate_lower_hex(input, field_name)?;
+
+    hex::decode(input).map_err(|_| {
+        ApiError::bad_request(format!("{field_name} must be valid lowercase hexadecimal"))
+    })
+}
+
+fn validate_lower_hex(input: &str, field_name: &str) -> Result<(), ApiError> {
+    let is_valid = input
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
 
     if is_valid {
         Ok(())
     } else {
+        Err(ApiError::bad_request(format!(
+            "{field_name} must be valid lowercase hexadecimal"
+        )))
+    }
+}
+
+fn validate_fresh_timestamp(timestamp_ms: u64) -> Result<(), ApiError> {
+    let now_ms = now_unix_ms()?;
+    let window_ms = duration_millis_u64(FRESHNESS_WINDOW);
+
+    if now_ms.abs_diff(timestamp_ms) <= window_ms {
+        Ok(())
+    } else {
         Err(ApiError::bad_request(
-            "pubkey must be exactly 64 lowercase hexadecimal characters",
+            "timestamp_ms is outside the allowed freshness window",
         ))
     }
 }
 
-fn is_expired(message: &StoredMessage) -> bool {
-    Instant::now() >= message.expires_at
+fn verify_ed25519_signature(
+    pubkey_hex: &str,
+    message: &[u8],
+    signature_hex: &str,
+) -> Result<(), ApiError> {
+    let key_bytes = decode_fixed_hex(pubkey_hex, ED25519_PUBLIC_KEY_HEX_LEN, "public key")?;
+    let key_array: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| ApiError::bad_request("public key must decode to 32 bytes"))?;
+    let verifying_key = VerifyingKey::from_bytes(&key_array)
+        .map_err(|_| ApiError::bad_request("public key must be a valid Ed25519 public key"))?;
+
+    let signature_bytes = decode_fixed_hex(signature_hex, SIGNATURE_HEX_LEN, "signature")?;
+    let signature_array: [u8; 64] = signature_bytes
+        .try_into()
+        .map_err(|_| ApiError::bad_request("signature must decode to 64 bytes"))?;
+    let signature = Signature::from_bytes(&signature_array);
+
+    verifying_key
+        .verify_strict(message, &signature)
+        .map_err(|_| ApiError::unauthorized("signature verification failed"))
+}
+
+fn replay_cache_key(scope: &str, canonical: &str, signature_hex: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(scope.as_bytes());
+    hasher.update([0]);
+    hasher.update(canonical.as_bytes());
+    hasher.update([0]);
+    hasher.update(signature_hex.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn retain_unexpired_messages(messages: &mut Vec<StoredMessage>) -> usize {
@@ -222,24 +453,42 @@ fn retain_unexpired_messages(messages: &mut Vec<StoredMessage>) -> usize {
     before.saturating_sub(messages.len())
 }
 
-fn count_expired_messages(messages: &[StoredMessage]) -> usize {
-    messages
-        .iter()
-        .filter(|message| is_expired(message))
-        .count()
+fn retain_unexpired_replay_entries(cache: &mut HashMap<String, Instant>) -> usize {
+    let before = cache.len();
+    retain_expired_replay_entries(cache);
+    before.saturating_sub(cache.len())
 }
 
-fn format_message_for_log(body: &str) -> String {
-    const MAX_BODY_PREVIEW: usize = 200;
+fn retain_expired_replay_entries(cache: &mut HashMap<String, Instant>) {
+    let now = Instant::now();
+    cache.retain(|_, expires_at| *expires_at > now);
+}
 
-    let sanitized = body.replace('\n', "\\n");
-    let mut preview = sanitized.chars().take(MAX_BODY_PREVIEW).collect::<String>();
+fn is_expired(message: &StoredMessage) -> bool {
+    Instant::now() >= message.expires_at
+}
 
-    if sanitized.chars().count() > MAX_BODY_PREVIEW {
-        preview.push_str("...");
+fn now_unix_ms() -> Result<u64, ApiError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ApiError::internal("system time is before UNIX epoch"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| ApiError::internal("system time exceeded supported range"))?)
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn format_hex_preview(value: &str) -> String {
+    const MAX_PREVIEW: usize = 64;
+
+    if value.len() <= MAX_PREVIEW {
+        return value.to_owned();
     }
 
-    format!("{preview:?}")
+    format!("{}...", &value[..MAX_PREVIEW])
 }
 
 fn public_help_text() -> &'static str {
@@ -289,6 +538,27 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -298,5 +568,419 @@ impl IntoResponse for ApiError {
         }));
 
         (self.status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Method;
+    use axum::http::Request;
+    use ed25519_dalek::{Signer, SigningKey};
+    use tower::util::ServiceExt;
+
+    const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+    fn signing_key(seed_byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed_byte; 32])
+    }
+
+    fn verifying_key_hex(signing_key: &SigningKey) -> String {
+        hex::encode(signing_key.verifying_key().to_bytes())
+    }
+
+    fn sender_x25519_hex(seed_byte: u8) -> String {
+        hex::encode([seed_byte; 32])
+    }
+
+    fn nonce_hex(seed_byte: u8) -> String {
+        hex::encode([seed_byte; 24])
+    }
+
+    fn ciphertext_hex(seed_byte: u8) -> String {
+        hex::encode([seed_byte; 48])
+    }
+
+    fn sign_send_request(
+        sender: &SigningKey,
+        recipient_hex: &str,
+        sender_x25519: &str,
+        nonce: &str,
+        timestamp_ms: u64,
+        ciphertext: &str,
+    ) -> String {
+        let canonical = canonical_send_message(
+            recipient_hex,
+            &verifying_key_hex(sender),
+            sender_x25519,
+            nonce,
+            timestamp_ms,
+            ciphertext,
+        );
+        hex::encode(sender.sign(canonical.as_bytes()).to_bytes())
+    }
+
+    fn sign_read_request(
+        recipient: &SigningKey,
+        recipient_hex: &str,
+        timestamp_ms: u64,
+        nonce: &str,
+    ) -> String {
+        let canonical = canonical_read_message(recipient_hex, timestamp_ms, nonce);
+        hex::encode(recipient.sign(canonical.as_bytes()).to_bytes())
+    }
+
+    async fn send_request(router: Router, request: Request<Body>) -> Response {
+        router.oneshot(request).await.unwrap()
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn valid_signed_send_and_read_are_accepted() {
+        let state = AppState::new();
+        let router = build_router(state);
+
+        let recipient = signing_key(9);
+        let sender = signing_key(7);
+        let recipient_hex = verifying_key_hex(&recipient);
+        let sender_hex = verifying_key_hex(&sender);
+        let sender_x25519 = sender_x25519_hex(3);
+        let nonce = nonce_hex(5);
+        let timestamp_ms = now_unix_ms().unwrap();
+        let ciphertext = ciphertext_hex(4);
+        let signature = sign_send_request(
+            &sender,
+            &recipient_hex,
+            &sender_x25519,
+            &nonce,
+            timestamp_ms,
+            &ciphertext,
+        );
+
+        let send_payload = serde_json::json!({
+            "from": sender_hex,
+            "sender_x25519": sender_x25519,
+            "nonce": nonce,
+            "timestamp_ms": timestamp_ms,
+            "ciphertext": ciphertext,
+            "signature": signature,
+        });
+
+        let send_response = send_request(
+            router.clone(),
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(send_payload.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(send_response.status(), StatusCode::ACCEPTED);
+
+        let read_nonce = nonce_hex(6);
+        let read_signature =
+            sign_read_request(&recipient, &recipient_hex, timestamp_ms, &read_nonce);
+        let read_payload = serde_json::json!({
+            "timestamp_ms": timestamp_ms,
+            "nonce": read_nonce,
+            "signature": read_signature,
+        });
+
+        let read_response = send_request(
+            router,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}/read"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(read_payload.to_string()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(read_response.status(), StatusCode::OK);
+        let json = response_json(read_response).await;
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["from"], sender_hex);
+    }
+
+    #[tokio::test]
+    async fn invalid_signature_is_rejected() {
+        let state = AppState::new();
+        let router = build_router(state);
+
+        let recipient = signing_key(11);
+        let sender = signing_key(12);
+        let recipient_hex = verifying_key_hex(&recipient);
+        let sender_hex = verifying_key_hex(&sender);
+        let sender_x25519 = sender_x25519_hex(13);
+        let nonce = nonce_hex(14);
+        let timestamp_ms = now_unix_ms().unwrap();
+        let ciphertext = ciphertext_hex(15);
+        let signature = hex::encode([0u8; 64]);
+
+        let payload = serde_json::json!({
+            "from": sender_hex,
+            "sender_x25519": sender_x25519,
+            "nonce": nonce,
+            "timestamp_ms": timestamp_ms,
+            "ciphertext": ciphertext,
+            "signature": signature,
+        });
+
+        let response = send_request(
+            router,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn malformed_hex_is_rejected() {
+        let state = AppState::new();
+        let router = build_router(state);
+
+        let recipient = signing_key(21);
+        let sender = signing_key(22);
+        let recipient_hex = verifying_key_hex(&recipient);
+        let sender_hex = verifying_key_hex(&sender);
+        let timestamp_ms = now_unix_ms().unwrap();
+        let payload = serde_json::json!({
+            "from": sender_hex,
+            "sender_x25519": "xyz",
+            "nonce": nonce_hex(23),
+            "timestamp_ms": timestamp_ms,
+            "ciphertext": ciphertext_hex(24),
+            "signature": sign_send_request(
+                &sender,
+                &recipient_hex,
+                &sender_x25519_hex(25),
+                &nonce_hex(23),
+                timestamp_ms,
+                &ciphertext_hex(24),
+            ),
+        });
+
+        let response = send_request(
+            router,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn stale_timestamp_is_rejected() {
+        let state = AppState::new();
+        let router = build_router(state);
+
+        let recipient = signing_key(31);
+        let sender = signing_key(32);
+        let recipient_hex = verifying_key_hex(&recipient);
+        let sender_hex = verifying_key_hex(&sender);
+        let sender_x25519 = sender_x25519_hex(33);
+        let nonce = nonce_hex(34);
+        let timestamp_ms = now_unix_ms().unwrap() - duration_millis_u64(FRESHNESS_WINDOW) - 1;
+        let ciphertext = ciphertext_hex(35);
+        let signature = sign_send_request(
+            &sender,
+            &recipient_hex,
+            &sender_x25519,
+            &nonce,
+            timestamp_ms,
+            &ciphertext,
+        );
+
+        let payload = serde_json::json!({
+            "from": sender_hex,
+            "sender_x25519": sender_x25519,
+            "nonce": nonce,
+            "timestamp_ms": timestamp_ms,
+            "ciphertext": ciphertext,
+            "signature": signature,
+        });
+
+        let response = send_request(
+            router,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn duplicate_send_is_rejected() {
+        let state = AppState::new();
+        let router = build_router(state);
+
+        let recipient = signing_key(41);
+        let sender = signing_key(42);
+        let recipient_hex = verifying_key_hex(&recipient);
+        let sender_hex = verifying_key_hex(&sender);
+        let sender_x25519 = sender_x25519_hex(43);
+        let nonce = nonce_hex(44);
+        let timestamp_ms = now_unix_ms().unwrap();
+        let ciphertext = ciphertext_hex(45);
+        let signature = sign_send_request(
+            &sender,
+            &recipient_hex,
+            &sender_x25519,
+            &nonce,
+            timestamp_ms,
+            &ciphertext,
+        );
+
+        let payload = serde_json::json!({
+            "from": sender_hex,
+            "sender_x25519": sender_x25519,
+            "nonce": nonce,
+            "timestamp_ms": timestamp_ms,
+            "ciphertext": ciphertext,
+            "signature": signature,
+        })
+        .to_string();
+
+        let first = send_request(
+            router.clone(),
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.clone()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+        let second = send_request(
+            router,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn duplicate_read_is_rejected() {
+        let state = AppState::new();
+        let router = build_router(state);
+
+        let recipient = signing_key(51);
+        let recipient_hex = verifying_key_hex(&recipient);
+        let timestamp_ms = now_unix_ms().unwrap();
+        let nonce = nonce_hex(52);
+        let signature = sign_read_request(&recipient, &recipient_hex, timestamp_ms, &nonce);
+
+        let payload = serde_json::json!({
+            "timestamp_ms": timestamp_ms,
+            "nonce": nonce,
+            "signature": signature,
+        })
+        .to_string();
+
+        let first = send_request(
+            router.clone(),
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}/read"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.clone()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = send_request(
+            router,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}/read"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn expired_messages_are_dropped_on_read() {
+        let state = AppState::new();
+        let recipient = signing_key(61);
+        let recipient_hex = verifying_key_hex(&recipient);
+
+        {
+            let mut store = state.store.write().await;
+            store.insert(
+                recipient_hex.clone(),
+                vec![StoredMessage {
+                    id: 1,
+                    from: verifying_key_hex(&signing_key(62)),
+                    sender_x25519: sender_x25519_hex(63),
+                    nonce: nonce_hex(64),
+                    timestamp_ms: now_unix_ms().unwrap(),
+                    ciphertext: ciphertext_hex(65),
+                    received_at: SystemTime::now(),
+                    expires_at: Instant::now() - Duration::from_secs(1),
+                }],
+            );
+        }
+
+        let router = build_router(state);
+        let read_nonce = nonce_hex(66);
+        let timestamp_ms = now_unix_ms().unwrap();
+        let signature = sign_read_request(&recipient, &recipient_hex, timestamp_ms, &read_nonce);
+        let payload = serde_json::json!({
+            "timestamp_ms": timestamp_ms,
+            "nonce": read_nonce,
+            "signature": signature,
+        });
+
+        let response = send_request(
+            router,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}/read"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["messages"].as_array().unwrap().len(), 0);
     }
 }
