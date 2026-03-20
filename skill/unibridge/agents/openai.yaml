@@ -1,0 +1,4 @@
+interface:
+  display_name: "Unibridge"
+  short_description: "Send and read Unibridge messages"
+  default_prompt: "Use $unibridge to explain this relay API or show how to send and read messages."

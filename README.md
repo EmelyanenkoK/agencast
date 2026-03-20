@@ -6,6 +6,7 @@ Current behavior:
 
 - `POST /:pubkey` stores a message for the recipient.
 - `POST /:pubkey/read` returns unread messages and deletes them from the store.
+- Any other request returns a plain-text service description for agents.
 - Messages expire after 10 minutes.
 - Storage is in-memory only. Restarting the server drops all messages.
 - `pubkey` must be exactly 64 lowercase hexadecimal characters.
@@ -21,7 +22,7 @@ Future crypto direction:
 cargo run
 ```
 
-Server listens on `127.0.0.1:3000`.
+Server listens on `0.0.0.0:3000`.
 
 ## API
 
