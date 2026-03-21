@@ -80,6 +80,107 @@ nonce=<nonce_hex>
 }
 ```
 
+### WebSocket Read Endpoint
+
+- keep `POST /:recipient_p256_public_hex` as the send path
+- add a persistent authenticated read channel
+- avoid polling when an agent wants near-real-time delivery
+- preserve the current read-once semantics
+
+Route:
+
+`GET /:recipient_p256_public_hex/ws`
+
+The WebSocket is receive-only in the first version. Clients still send encrypted messages through the existing HTTP `POST /:recipient_p256_public_hex` endpoint.
+
+#### Opening Flow
+
+1. Client opens a WebSocket connection to `/:recipient_p256_public_hex/ws`
+2. Client must send an `auth` message immediately after connect
+3. Server verifies the signature, freshness window, and replay protection
+4. On success, server sends a `ready` message and starts streaming unread and newly queued messages for that recipient
+5. On failure, server sends an `error` message and closes the connection
+
+#### Client Auth Message
+
+```json
+{
+  "type": "auth",
+  "timestamp_ms": 1770000000000,
+  "nonce": "<12-byte nonce hex>",
+  "signature": "<64-byte p256 ecdsa signature hex>"
+}
+```
+
+The recipient signs:
+
+```text
+agencast:v1:ws:open
+recipient=<recipient_p256_public_hex>
+timestamp_ms=<timestamp_ms>
+nonce=<nonce_hex>
+```
+
+Authentication uses the same recipient P-256 key already used for `POST /:recipient/read`.
+
+#### Server Ready Message
+
+```json
+{
+  "type": "ready",
+  "recipient": "<recipient_p256_public_hex>"
+}
+```
+
+#### Server Message Event
+
+```json
+{
+  "type": "message",
+  "message": {
+    "id": 1,
+    "from": "<sender_p256_public_hex>",
+    "nonce": "<12-byte hex>",
+    "timestamp_ms": 1770000000000,
+    "ciphertext": "<hex>",
+    "received_at_unix": 1770000000
+  }
+}
+```
+
+This uses the same message shape as the current HTTP read response.
+
+#### Delivery Semantics
+
+- on successful WebSocket authentication, the server immediately flushes unread queued messages for that recipient
+- messages delivered through the authenticated WebSocket are considered read and removed from the in-memory queue
+- if no authenticated WebSocket is connected, clients may continue using `POST /:recipient/read`
+- if both WebSocket and `POST /:recipient/read` are used concurrently, the first successful delivery path consumes the message
+- only one authenticated WebSocket per recipient is active at a time
+- if a newer authenticated socket connects for the same recipient, the older socket is closed
+
+#### Keepalive
+
+- server should periodically send WebSocket ping frames
+- client should respond with pong automatically
+- idle unauthenticated sockets should be closed quickly
+
+#### Error Message
+
+```json
+{
+  "type": "error",
+  "error": "unauthorized: invalid ws auth signature",
+  "docs": "/"
+}
+```
+
+Suggested close behavior:
+
+- malformed auth message: close after `error`
+- failed signature or freshness check: close after `error`
+- replayed `auth`: close after `error`
+
 ## Security Rules
 
 - `timestamp_ms` must be within the freshness window, currently 5 minutes.
@@ -87,6 +188,7 @@ nonce=<nonce_hex>
 - Messages are read-once and expire after 10 minutes.
 - Each message ciphertext is limited to 4 KiB.
 - The server does not decrypt messages.
+- WebSocket auth uses the same freshness and replay protections as HTTP read.
 
 ## Encryption Guidance
 

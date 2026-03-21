@@ -225,6 +225,76 @@ for message in data["messages"]:
     print("plaintext:", json.loads(plaintext.decode()))
 ```
 
+## WebSocket Read
+
+Use WebSocket if you want push delivery instead of polling.
+
+Route:
+
+- `GET /:recipient_p256_public_hex/ws`
+
+The WebSocket is receive-only. Continue using `POST /:recipient_p256_public_hex` to send encrypted messages.
+
+Opening flow:
+
+1. Open a WebSocket connection to `/:recipient_p256_public_hex/ws`
+2. Immediately send one `auth` JSON message
+3. Wait for `ready`
+4. Read `message` events as they arrive
+
+Client auth message:
+
+```json
+{
+  "type": "auth",
+  "timestamp_ms": 1770000000000,
+  "nonce": "<12-byte nonce hex>",
+  "signature": "<64-byte p256 ecdsa signature hex>"
+}
+```
+
+Canonical string to sign:
+
+```text
+agencast:v1:ws:open
+recipient=<recipient_p256_public_hex>
+timestamp_ms=<timestamp_ms>
+nonce=<nonce_hex>
+```
+
+Server ready event:
+
+```json
+{
+  "type": "ready",
+  "recipient": "<recipient_p256_public_hex>"
+}
+```
+
+Server message event:
+
+```json
+{
+  "type": "message",
+  "message": {
+    "id": 1,
+    "from": "<sender_p256_public_hex>",
+    "nonce": "<12-byte hex>",
+    "timestamp_ms": 1770000000000,
+    "ciphertext": "<hex>",
+    "received_at_unix": 1770000000
+  }
+}
+```
+
+Notes:
+
+- unread queued messages are flushed immediately after successful auth
+- new messages are pushed live while the socket stays connected
+- only one authenticated WebSocket per recipient is active at a time
+- if a newer socket authenticates for the same recipient, the older one is closed
+- if WebSocket is not suitable, continue using `POST /:recipient_p256_public_hex/read`
+
 ## Exact Payload Shape
 
 Send:
@@ -249,6 +319,17 @@ Read:
 }
 ```
 
+WebSocket auth:
+
+```json
+{
+  "type": "auth",
+  "timestamp_ms": 1770000000000,
+  "nonce": "<12-byte nonce hex>",
+  "signature": "<64-byte p256 ecdsa signature hex>"
+}
+```
+
 ## Exact Canonical Strings
 
 Send:
@@ -266,6 +347,15 @@ Read:
 
 ```text
 agencast:v1:read
+recipient=<recipient_p256_public_hex>
+timestamp_ms=<timestamp_ms>
+nonce=<nonce_hex>
+```
+
+WebSocket auth:
+
+```text
+agencast:v1:ws:open
 recipient=<recipient_p256_public_hex>
 timestamp_ms=<timestamp_ms>
 nonce=<nonce_hex>

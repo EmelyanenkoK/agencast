@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     net::SocketAddr,
     sync::{
@@ -10,6 +11,7 @@ use std::{
 
 use axum::{
     extract::rejection::JsonRejection,
+    extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade},
     extract::{Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -22,7 +24,12 @@ use p256::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{net::TcpListener, signal, sync::RwLock, time::interval};
+use tokio::{
+    net::TcpListener,
+    signal,
+    sync::{mpsc, RwLock},
+    time::{interval, timeout},
+};
 
 const P256_PUBLIC_KEY_HEX_LEN: usize = 66;
 const NONCE_HEX_LEN: usize = 24;
@@ -31,6 +38,8 @@ const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 const MESSAGE_TTL: Duration = Duration::from_secs(10 * 60);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 const FRESHNESS_WINDOW: Duration = Duration::from_secs(5 * 60);
+const WS_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 const SKILL_TEXT: &str = include_str!("../skill/agencast/SKILL.md");
 const DOCS_PATH: &str = "/";
 
@@ -39,7 +48,10 @@ struct AppState {
     store: Arc<RwLock<HashMap<String, Vec<StoredMessage>>>>,
     send_replay_cache: Arc<RwLock<HashMap<String, Instant>>>,
     read_replay_cache: Arc<RwLock<HashMap<String, Instant>>>,
+    ws_open_replay_cache: Arc<RwLock<HashMap<String, Instant>>>,
+    active_ws_connections: Arc<RwLock<HashMap<String, ActiveWsConnection>>>,
     next_message_id: Arc<AtomicU64>,
+    next_connection_id: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -48,9 +60,18 @@ impl AppState {
             store: Arc::new(RwLock::new(HashMap::new())),
             send_replay_cache: Arc::new(RwLock::new(HashMap::new())),
             read_replay_cache: Arc::new(RwLock::new(HashMap::new())),
+            ws_open_replay_cache: Arc::new(RwLock::new(HashMap::new())),
+            active_ws_connections: Arc::new(RwLock::new(HashMap::new())),
             next_message_id: Arc::new(AtomicU64::new(1)),
+            next_connection_id: Arc::new(AtomicU64::new(1)),
         }
     }
+}
+
+#[derive(Clone)]
+struct ActiveWsConnection {
+    connection_id: u64,
+    sender: mpsc::UnboundedSender<WsControl>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -90,6 +111,29 @@ struct ReadMessagesResponse {
     messages: Vec<MessageView>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum ClientWsMessage {
+    Auth {
+        timestamp_ms: u64,
+        nonce: String,
+        signature: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum ServerWsEvent {
+    Ready { recipient: String },
+    Message { message: MessageView },
+    Error { error: String, docs: &'static str },
+}
+
+enum WsControl {
+    Deliver(StoredMessage),
+    Close { reason: String },
+}
+
 #[derive(Debug, Clone)]
 struct StoredMessage {
     id: u64,
@@ -99,6 +143,12 @@ struct StoredMessage {
     ciphertext: String,
     received_at: SystemTime,
     expires_at: Instant,
+}
+
+struct WsAuthContext {
+    timestamp_ms: u64,
+    nonce: String,
+    signature: String,
 }
 
 #[tokio::main]
@@ -123,6 +173,7 @@ async fn main() {
 
 fn build_router(state: AppState) -> Router {
     Router::new()
+        .route("/:pubkey/ws", get(websocket_connect))
         .route("/:pubkey", get(help_handler).post(send_message))
         .route("/:pubkey/read", get(help_handler).post(read_messages))
         .fallback(fallback_handler)
@@ -171,18 +222,28 @@ async fn send_message(
         expires_at: Instant::now() + MESSAGE_TTL,
     };
 
-    let mut store = state.store.write().await;
-    let queue = store.entry(recipient).or_default();
-    let expired_removed = retain_unexpired_messages(queue);
-    queue.push(message);
-    let queue_len = queue.len();
+    let live_delivery = try_push_live_message(&state, &recipient, &message).await;
+    let (queue_len, expired_removed) = if live_delivery {
+        (0, 0)
+    } else {
+        queue_message(&state, &recipient, message.clone()).await
+    };
 
-    println!(
-        "queued encrypted message id={message_id} from={} to={} queue_len={queue_len} expired_removed={expired_removed} ciphertext={}",
-        payload.from,
-        recipient_for_log,
-        format_hex_preview(&payload.ciphertext),
-    );
+    if live_delivery {
+        println!(
+            "pushed encrypted message id={message_id} from={} to={} via=websocket ciphertext={}",
+            payload.from,
+            recipient_for_log,
+            format_hex_preview(&payload.ciphertext),
+        );
+    } else {
+        println!(
+            "queued encrypted message id={message_id} from={} to={} queue_len={queue_len} expired_removed={expired_removed} ciphertext={}",
+            payload.from,
+            recipient_for_log,
+            format_hex_preview(&payload.ciphertext),
+        );
+    }
 
     Ok((
         StatusCode::ACCEPTED,
@@ -243,6 +304,116 @@ async fn read_messages(
     Ok(Json(ReadMessagesResponse { messages: unread }))
 }
 
+async fn websocket_connect(
+    ws: WebSocketUpgrade,
+    Path(recipient): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Response, ApiError> {
+    validate_p256_public_key_hex(&recipient, "recipient")?;
+
+    Ok(ws.on_upgrade(move |socket| websocket_session(socket, state, recipient)))
+}
+
+async fn websocket_session(mut socket: WebSocket, state: AppState, recipient: String) {
+    let auth = match receive_ws_auth(&mut socket, &recipient, &state).await {
+        Ok(auth) => auth,
+        Err(message) => {
+            let _ = send_ws_error(&mut socket, &message).await;
+            return;
+        }
+    };
+
+    let initial_unread = take_unread_messages(&state, &recipient).await;
+    let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let previous = register_active_ws_connection(
+        &state,
+        recipient.clone(),
+        ActiveWsConnection {
+            connection_id,
+            sender: sender.clone(),
+        },
+    )
+    .await;
+    if let Some(previous) = previous {
+        let _ = previous.sender.send(WsControl::Close {
+            reason: "replaced by newer websocket connection".to_owned(),
+        });
+    }
+    let late_unread = take_unread_messages(&state, &recipient).await;
+
+    if send_ws_event(
+        &mut socket,
+        ServerWsEvent::Ready {
+            recipient: recipient.clone(),
+        },
+    )
+    .await
+    .is_err()
+    {
+        cleanup_active_ws_connection(&state, &recipient, connection_id).await;
+        return;
+    }
+
+    let delivered =
+        stream_unread_messages(&mut socket, &state, &recipient, initial_unread, late_unread).await;
+    if delivered.is_none() {
+        cleanup_active_ws_connection(&state, &recipient, connection_id).await;
+        return;
+    }
+    let (delivered, expired_dropped) = delivered.unwrap();
+
+    println!(
+        "ws recipient={recipient} delivered={delivered} expired_dropped={expired_dropped} auth_nonce={}",
+        auth.nonce
+    );
+
+    let mut ping_interval = interval(WS_PING_INTERVAL);
+    loop {
+        tokio::select! {
+            maybe_control = receiver.recv() => {
+                match maybe_control {
+                    Some(WsControl::Deliver(message)) => {
+                        if send_ws_event(&mut socket, ServerWsEvent::Message { message: message_view(&message) }).await.is_err() {
+                            requeue_message(&state, &recipient, message).await;
+                            break;
+                        }
+                    }
+                    Some(WsControl::Close { reason }) => {
+                        let _ = send_ws_close(&mut socket, close_code::NORMAL, &reason).await;
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => {
+                        let _ = send_ws_error(&mut socket, "unexpected websocket client message after auth").await;
+                        break;
+                    }
+                    Some(Err(_)) | None => break,
+                }
+            }
+            _ = ping_interval.tick() => {
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    drain_pending_ws_messages(&state, &recipient, &mut receiver).await;
+    cleanup_active_ws_connection(&state, &recipient, connection_id).await;
+}
+
 async fn fallback_handler() -> impl IntoResponse {
     help_response()
 }
@@ -286,9 +457,18 @@ fn spawn_cleanup_task(state: AppState) {
                 retain_unexpired_replay_entries(&mut cache)
             };
 
-            if expired_messages > 0 || expired_send_replays > 0 || expired_read_replays > 0 {
+            let expired_ws_open_replays = {
+                let mut cache = state.ws_open_replay_cache.write().await;
+                retain_unexpired_replay_entries(&mut cache)
+            };
+
+            if expired_messages > 0
+                || expired_send_replays > 0
+                || expired_read_replays > 0
+                || expired_ws_open_replays > 0
+            {
                 println!(
-                    "cleanup removed expired_messages={expired_messages} expired_send_replays={expired_send_replays} expired_read_replays={expired_read_replays}"
+                    "cleanup removed expired_messages={expired_messages} expired_send_replays={expired_send_replays} expired_read_replays={expired_read_replays} expired_ws_open_replays={expired_ws_open_replays}"
                 );
             }
         }
@@ -309,6 +489,231 @@ fn canonical_send_message(
 
 fn canonical_read_message(recipient: &str, timestamp_ms: u64, nonce: &str) -> String {
     format!("agencast:v1:read\nrecipient={recipient}\ntimestamp_ms={timestamp_ms}\nnonce={nonce}")
+}
+
+fn canonical_ws_open_message(recipient: &str, timestamp_ms: u64, nonce: &str) -> String {
+    format!(
+        "agencast:v1:ws:open\nrecipient={recipient}\ntimestamp_ms={timestamp_ms}\nnonce={nonce}"
+    )
+}
+
+async fn try_push_live_message(state: &AppState, recipient: &str, message: &StoredMessage) -> bool {
+    let active_connection = {
+        let active = state.active_ws_connections.read().await;
+        active.get(recipient).cloned()
+    };
+
+    let Some(active_connection) = active_connection else {
+        return false;
+    };
+
+    if active_connection
+        .sender
+        .send(WsControl::Deliver(message.clone()))
+        .is_ok()
+    {
+        true
+    } else {
+        cleanup_active_ws_connection(state, recipient, active_connection.connection_id).await;
+        false
+    }
+}
+
+async fn register_active_ws_connection(
+    state: &AppState,
+    recipient: String,
+    connection: ActiveWsConnection,
+) -> Option<ActiveWsConnection> {
+    let mut active = state.active_ws_connections.write().await;
+    active.insert(recipient, connection)
+}
+
+async fn cleanup_active_ws_connection(state: &AppState, recipient: &str, connection_id: u64) {
+    let mut active = state.active_ws_connections.write().await;
+    if active
+        .get(recipient)
+        .is_some_and(|connection| connection.connection_id == connection_id)
+    {
+        active.remove(recipient);
+    }
+}
+
+async fn take_unread_messages(state: &AppState, recipient: &str) -> Vec<StoredMessage> {
+    let mut store = state.store.write().await;
+    store.remove(recipient).unwrap_or_default()
+}
+
+async fn queue_message(
+    state: &AppState,
+    recipient: &str,
+    message: StoredMessage,
+) -> (usize, usize) {
+    let mut store = state.store.write().await;
+    let queue = store.entry(recipient.to_owned()).or_default();
+    let expired_removed = retain_unexpired_messages(queue);
+    queue.push(message);
+    (queue.len(), expired_removed)
+}
+
+async fn requeue_message(state: &AppState, recipient: &str, message: StoredMessage) {
+    if is_expired(&message) {
+        return;
+    }
+
+    let _ = queue_message(state, recipient, message).await;
+}
+
+async fn drain_pending_ws_messages(
+    state: &AppState,
+    recipient: &str,
+    receiver: &mut mpsc::UnboundedReceiver<WsControl>,
+) {
+    while let Ok(control) = receiver.try_recv() {
+        if let WsControl::Deliver(message) = control {
+            requeue_message(state, recipient, message).await;
+        }
+    }
+}
+
+async fn receive_ws_auth(
+    socket: &mut WebSocket,
+    recipient: &str,
+    state: &AppState,
+) -> Result<WsAuthContext, String> {
+    let message = match timeout(WS_AUTH_TIMEOUT, socket.recv()).await {
+        Ok(Some(Ok(message))) => message,
+        Ok(Some(Err(_))) => return Err("invalid websocket frame during auth".to_owned()),
+        Ok(None) => return Err("websocket closed before auth".to_owned()),
+        Err(_) => return Err("websocket auth timeout".to_owned()),
+    };
+
+    let auth = parse_ws_auth_message(message)?;
+    validate_nonce_hex(&auth.nonce).map_err(|error| error.message)?;
+    validate_signature_hex(&auth.signature).map_err(|error| error.message)?;
+    validate_fresh_timestamp(auth.timestamp_ms).map_err(|error| error.message)?;
+
+    let canonical = canonical_ws_open_message(recipient, auth.timestamp_ms, &auth.nonce);
+    verify_p256_signature(recipient, canonical.as_bytes(), &auth.signature)
+        .map_err(|error| format!("unauthorized: {}", error.message))?;
+
+    let replay_key = replay_cache_key("ws-open", &canonical, &auth.signature);
+    register_replay_key(
+        &state.ws_open_replay_cache,
+        replay_key,
+        Instant::now() + FRESHNESS_WINDOW,
+    )
+    .await
+    .map_err(|error| error.message)?;
+
+    Ok(auth)
+}
+
+fn parse_ws_auth_message(message: Message) -> Result<WsAuthContext, String> {
+    let text = match message {
+        Message::Text(text) => text.to_string(),
+        Message::Close(_) => return Err("websocket closed before auth".to_owned()),
+        Message::Ping(_) | Message::Pong(_) => {
+            return Err("expected websocket auth text frame".to_owned())
+        }
+        Message::Binary(_) => return Err("expected websocket auth text frame".to_owned()),
+    };
+
+    match serde_json::from_str::<ClientWsMessage>(&text) {
+        Ok(ClientWsMessage::Auth {
+            timestamp_ms,
+            nonce,
+            signature,
+        }) => Ok(WsAuthContext {
+            timestamp_ms,
+            nonce,
+            signature,
+        }),
+        Err(error) => Err(format!("invalid websocket auth payload: {error}")),
+    }
+}
+
+async fn stream_unread_messages(
+    socket: &mut WebSocket,
+    state: &AppState,
+    recipient: &str,
+    initial_unread: Vec<StoredMessage>,
+    late_unread: Vec<StoredMessage>,
+) -> Option<(usize, usize)> {
+    let mut delivered = 0usize;
+    let mut expired_dropped = 0usize;
+
+    let mut unread_iter = initial_unread.into_iter().chain(late_unread);
+    while let Some(message) = unread_iter.next() {
+        if is_expired(&message) {
+            expired_dropped += 1;
+            continue;
+        }
+
+        if send_ws_event(
+            socket,
+            ServerWsEvent::Message {
+                message: message_view(&message),
+            },
+        )
+        .await
+        .is_err()
+        {
+            requeue_message(state, recipient, message).await;
+            while let Some(pending) = unread_iter.next() {
+                requeue_message(state, recipient, pending).await;
+            }
+            return None;
+        }
+        delivered += 1;
+    }
+
+    Some((delivered, expired_dropped))
+}
+
+fn message_view(message: &StoredMessage) -> MessageView {
+    MessageView {
+        id: message.id,
+        from: message.from.clone(),
+        nonce: message.nonce.clone(),
+        timestamp_ms: message.timestamp_ms,
+        ciphertext: message.ciphertext.clone(),
+        received_at_unix: message
+            .received_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    }
+}
+
+async fn send_ws_event(socket: &mut WebSocket, event: ServerWsEvent) -> Result<(), ()> {
+    let payload = serde_json::to_string(&event).map_err(|_| ())?;
+    socket
+        .send(Message::Text(payload.into()))
+        .await
+        .map_err(|_| ())
+}
+
+async fn send_ws_error(socket: &mut WebSocket, error: &str) -> Result<(), ()> {
+    let _ = send_ws_event(
+        socket,
+        ServerWsEvent::Error {
+            error: error.to_owned(),
+            docs: DOCS_PATH,
+        },
+    )
+    .await;
+
+    send_ws_close(socket, close_code::POLICY, error).await
+}
+
+async fn send_ws_close(socket: &mut WebSocket, code: u16, reason: &str) -> Result<(), ()> {
+    socket
+        .send(Message::Close(Some(CloseFrame {
+            code,
+            reason: Cow::Owned(reason.to_owned()),
+        })))
+        .await
+        .map_err(|_| ())
 }
 
 async fn register_replay_key(
@@ -591,7 +996,10 @@ mod tests {
         body::{to_bytes, Body},
         http::{Method, Request},
     };
+    use futures_util::{SinkExt, StreamExt};
     use p256::ecdsa::{signature::Signer, SigningKey};
+    use tokio::{net::TcpListener, sync::oneshot};
+    use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
     use tower::util::ServiceExt;
 
     const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -647,6 +1055,17 @@ mod tests {
         hex::encode(signature.to_bytes())
     }
 
+    fn sign_ws_open_request(
+        recipient: &SigningKey,
+        recipient_hex: &str,
+        timestamp_ms: u64,
+        nonce: &str,
+    ) -> String {
+        let canonical = canonical_ws_open_message(recipient_hex, timestamp_ms, nonce);
+        let signature: Signature = recipient.sign(canonical.as_bytes());
+        hex::encode(signature.to_bytes())
+    }
+
     fn tamper_signature_hex(signature_hex: &str) -> String {
         let mut bytes = signature_hex.as_bytes().to_vec();
         bytes[0] = if bytes[0] == b'0' { b'1' } else { b'0' };
@@ -669,6 +1088,81 @@ mod tests {
             .await
             .unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn spawn_ws_test_server(state: AppState) -> (SocketAddr, oneshot::Sender<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let app = build_router(state);
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        (addr, shutdown_tx)
+    }
+
+    async fn connect_ws(
+        addr: SocketAddr,
+        recipient_hex: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let url = format!("ws://{addr}/{recipient_hex}/ws");
+        let (socket, _) = connect_async(url).await.unwrap();
+        socket
+    }
+
+    async fn read_ws_event(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> serde_json::Value {
+        while let Some(message) = socket.next().await {
+            match message.unwrap() {
+                TungsteniteMessage::Text(text) => {
+                    return serde_json::from_str(&text).unwrap();
+                }
+                TungsteniteMessage::Ping(payload) => {
+                    socket
+                        .send(TungsteniteMessage::Pong(payload))
+                        .await
+                        .unwrap();
+                }
+                TungsteniteMessage::Pong(_) => {}
+                TungsteniteMessage::Close(frame) => panic!("unexpected close frame: {frame:?}"),
+                other => panic!("unexpected websocket frame: {other:?}"),
+            }
+        }
+
+        panic!("websocket closed before event")
+    }
+
+    async fn expect_ws_close(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) {
+        while let Some(message) = socket.next().await {
+            match message.unwrap() {
+                TungsteniteMessage::Close(_) => return,
+                TungsteniteMessage::Ping(payload) => {
+                    socket
+                        .send(TungsteniteMessage::Pong(payload))
+                        .await
+                        .unwrap();
+                }
+                TungsteniteMessage::Pong(_) => {}
+                other => panic!("unexpected websocket frame while waiting for close: {other:?}"),
+            }
+        }
+
+        panic!("websocket closed without close frame")
     }
 
     #[tokio::test]
@@ -1098,5 +1592,293 @@ mod tests {
             json["hint"],
             "See GET / for protocol documentation and request examples."
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_auth_flushes_unread_messages() {
+        let state = AppState::new();
+        let router = build_router(state.clone());
+        let (addr, shutdown_tx) = spawn_ws_test_server(state).await;
+
+        let recipient = signing_key(81);
+        let sender = signing_key(82);
+        let recipient_hex = verifying_key_hex(&recipient);
+        let sender_hex = verifying_key_hex(&sender);
+        let nonce = nonce_hex(83);
+        let timestamp_ms = now_unix_ms().unwrap();
+        let ciphertext = ciphertext_hex(84);
+        let signature =
+            sign_send_request(&sender, &recipient_hex, &nonce, timestamp_ms, &ciphertext);
+        let send_payload = serde_json::json!({
+            "from": sender_hex,
+            "nonce": nonce,
+            "timestamp_ms": timestamp_ms,
+            "ciphertext": ciphertext,
+            "signature": signature,
+        });
+
+        let send_response = send_request(
+            router,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(send_payload.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(send_response.status(), StatusCode::ACCEPTED);
+
+        let mut socket = connect_ws(addr, &recipient_hex).await;
+        let auth_nonce = nonce_hex(85);
+        let auth_timestamp_ms = now_unix_ms().unwrap();
+        let auth_signature =
+            sign_ws_open_request(&recipient, &recipient_hex, auth_timestamp_ms, &auth_nonce);
+        let auth_payload = serde_json::json!({
+            "type": "auth",
+            "timestamp_ms": auth_timestamp_ms,
+            "nonce": auth_nonce,
+            "signature": auth_signature,
+        });
+        socket
+            .send(TungsteniteMessage::Text(auth_payload.to_string()))
+            .await
+            .unwrap();
+
+        let ready = read_ws_event(&mut socket).await;
+        assert_eq!(ready["type"], "ready");
+        assert_eq!(ready["recipient"], recipient_hex);
+
+        let message = read_ws_event(&mut socket).await;
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["message"]["from"], sender_hex);
+        assert_eq!(message["message"]["ciphertext"], ciphertext);
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn websocket_invalid_signature_is_rejected() {
+        let state = AppState::new();
+        let (addr, shutdown_tx) = spawn_ws_test_server(state).await;
+
+        let recipient = signing_key(86);
+        let recipient_hex = verifying_key_hex(&recipient);
+        let mut socket = connect_ws(addr, &recipient_hex).await;
+        let auth_nonce = nonce_hex(87);
+        let auth_timestamp_ms = now_unix_ms().unwrap();
+        let auth_signature = tamper_signature_hex(&sign_ws_open_request(
+            &recipient,
+            &recipient_hex,
+            auth_timestamp_ms,
+            &auth_nonce,
+        ));
+        let auth_payload = serde_json::json!({
+            "type": "auth",
+            "timestamp_ms": auth_timestamp_ms,
+            "nonce": auth_nonce,
+            "signature": auth_signature,
+        });
+        socket
+            .send(TungsteniteMessage::Text(auth_payload.to_string()))
+            .await
+            .unwrap();
+
+        let error = read_ws_event(&mut socket).await;
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["docs"], DOCS_PATH);
+
+        let close = socket.next().await.unwrap().unwrap();
+        assert!(matches!(close, TungsteniteMessage::Close(_)));
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn websocket_live_delivery_receives_new_http_sends() {
+        let state = AppState::new();
+        let router = build_router(state.clone());
+        let (addr, shutdown_tx) = spawn_ws_test_server(state).await;
+
+        let recipient = signing_key(88);
+        let sender = signing_key(89);
+        let recipient_hex = verifying_key_hex(&recipient);
+        let sender_hex = verifying_key_hex(&sender);
+        let mut socket = connect_ws(addr, &recipient_hex).await;
+        let auth_nonce = nonce_hex(90);
+        let auth_timestamp_ms = now_unix_ms().unwrap();
+        let auth_signature =
+            sign_ws_open_request(&recipient, &recipient_hex, auth_timestamp_ms, &auth_nonce);
+        let auth_payload = serde_json::json!({
+            "type": "auth",
+            "timestamp_ms": auth_timestamp_ms,
+            "nonce": auth_nonce,
+            "signature": auth_signature,
+        });
+        socket
+            .send(TungsteniteMessage::Text(auth_payload.to_string()))
+            .await
+            .unwrap();
+        let ready = read_ws_event(&mut socket).await;
+        assert_eq!(ready["type"], "ready");
+
+        let nonce = nonce_hex(91);
+        let timestamp_ms = now_unix_ms().unwrap();
+        let ciphertext = ciphertext_hex(92);
+        let signature =
+            sign_send_request(&sender, &recipient_hex, &nonce, timestamp_ms, &ciphertext);
+        let send_payload = serde_json::json!({
+            "from": sender_hex,
+            "nonce": nonce,
+            "timestamp_ms": timestamp_ms,
+            "ciphertext": ciphertext,
+            "signature": signature,
+        });
+
+        let response = send_request(
+            router,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(send_payload.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let message = read_ws_event(&mut socket).await;
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["message"]["from"], sender_hex);
+        assert_eq!(message["message"]["ciphertext"], ciphertext);
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn websocket_replayed_auth_is_rejected() {
+        let state = AppState::new();
+        let (addr, shutdown_tx) = spawn_ws_test_server(state).await;
+
+        let recipient = signing_key(93);
+        let recipient_hex = verifying_key_hex(&recipient);
+        let auth_nonce = nonce_hex(94);
+        let auth_timestamp_ms = now_unix_ms().unwrap();
+        let auth_signature =
+            sign_ws_open_request(&recipient, &recipient_hex, auth_timestamp_ms, &auth_nonce);
+        let auth_payload = serde_json::json!({
+            "type": "auth",
+            "timestamp_ms": auth_timestamp_ms,
+            "nonce": auth_nonce,
+            "signature": auth_signature,
+        })
+        .to_string();
+
+        let mut first_socket = connect_ws(addr, &recipient_hex).await;
+        first_socket
+            .send(TungsteniteMessage::Text(auth_payload.clone()))
+            .await
+            .unwrap();
+        let ready = read_ws_event(&mut first_socket).await;
+        assert_eq!(ready["type"], "ready");
+
+        let mut second_socket = connect_ws(addr, &recipient_hex).await;
+        second_socket
+            .send(TungsteniteMessage::Text(auth_payload))
+            .await
+            .unwrap();
+        let error = read_ws_event(&mut second_socket).await;
+        assert_eq!(error["type"], "error");
+        assert!(error["error"]
+            .as_str()
+            .unwrap()
+            .contains("duplicate request rejected by replay protection"));
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn websocket_second_authenticated_socket_replaces_first() {
+        let state = AppState::new();
+        let router = build_router(state.clone());
+        let (addr, shutdown_tx) = spawn_ws_test_server(state).await;
+
+        let recipient = signing_key(95);
+        let sender = signing_key(96);
+        let recipient_hex = verifying_key_hex(&recipient);
+        let sender_hex = verifying_key_hex(&sender);
+
+        let mut first_socket = connect_ws(addr, &recipient_hex).await;
+        let first_nonce = nonce_hex(97);
+        let first_timestamp_ms = now_unix_ms().unwrap();
+        let first_signature =
+            sign_ws_open_request(&recipient, &recipient_hex, first_timestamp_ms, &first_nonce);
+        let first_auth_payload = serde_json::json!({
+            "type": "auth",
+            "timestamp_ms": first_timestamp_ms,
+            "nonce": first_nonce,
+            "signature": first_signature,
+        });
+        first_socket
+            .send(TungsteniteMessage::Text(first_auth_payload.to_string()))
+            .await
+            .unwrap();
+        let first_ready = read_ws_event(&mut first_socket).await;
+        assert_eq!(first_ready["type"], "ready");
+
+        let mut second_socket = connect_ws(addr, &recipient_hex).await;
+        let second_nonce = nonce_hex(98);
+        let second_timestamp_ms = now_unix_ms().unwrap();
+        let second_signature = sign_ws_open_request(
+            &recipient,
+            &recipient_hex,
+            second_timestamp_ms,
+            &second_nonce,
+        );
+        let second_auth_payload = serde_json::json!({
+            "type": "auth",
+            "timestamp_ms": second_timestamp_ms,
+            "nonce": second_nonce,
+            "signature": second_signature,
+        });
+        second_socket
+            .send(TungsteniteMessage::Text(second_auth_payload.to_string()))
+            .await
+            .unwrap();
+        let second_ready = read_ws_event(&mut second_socket).await;
+        assert_eq!(second_ready["type"], "ready");
+
+        expect_ws_close(&mut first_socket).await;
+
+        let nonce = nonce_hex(99);
+        let timestamp_ms = now_unix_ms().unwrap();
+        let ciphertext = ciphertext_hex(100);
+        let signature =
+            sign_send_request(&sender, &recipient_hex, &nonce, timestamp_ms, &ciphertext);
+        let send_payload = serde_json::json!({
+            "from": sender_hex,
+            "nonce": nonce,
+            "timestamp_ms": timestamp_ms,
+            "ciphertext": ciphertext,
+            "signature": signature,
+        });
+
+        let response = send_request(
+            router,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{recipient_hex}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(send_payload.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let message = read_ws_event(&mut second_socket).await;
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["message"]["from"], sender_hex);
+
+        let _ = shutdown_tx.send(());
     }
 }
