@@ -37,6 +37,7 @@ const SIGNATURE_HEX_LEN: usize = 128;
 const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 const MESSAGE_TTL: Duration = Duration::from_secs(10 * 60);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+const ACTIVITY_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const FRESHNESS_WINDOW: Duration = Duration::from_secs(5 * 60);
 const WS_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -52,6 +53,8 @@ struct AppState {
     active_ws_connections: Arc<RwLock<HashMap<String, ActiveWsConnection>>>,
     next_message_id: Arc<AtomicU64>,
     next_connection_id: Arc<AtomicU64>,
+    accepted_messages: Arc<AtomicU64>,
+    accepted_read_requests: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -64,6 +67,8 @@ impl AppState {
             active_ws_connections: Arc::new(RwLock::new(HashMap::new())),
             next_message_id: Arc::new(AtomicU64::new(1)),
             next_connection_id: Arc::new(AtomicU64::new(1)),
+            accepted_messages: Arc::new(AtomicU64::new(0)),
+            accepted_read_requests: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -155,6 +160,7 @@ struct WsAuthContext {
 async fn main() {
     let state = AppState::new();
     spawn_cleanup_task(state.clone());
+    spawn_activity_log_task(state.clone());
 
     let app = build_router(state);
 
@@ -210,7 +216,6 @@ async fn send_message(
     )
     .await?;
 
-    let recipient_for_log = recipient.clone();
     let message_id = state.next_message_id.fetch_add(1, Ordering::Relaxed);
     let message = StoredMessage {
         id: message_id,
@@ -228,22 +233,8 @@ async fn send_message(
     } else {
         queue_message(&state, &recipient, message.clone()).await
     };
-
-    if live_delivery {
-        println!(
-            "pushed encrypted message id={message_id} from={} to={} via=websocket ciphertext={}",
-            payload.from,
-            recipient_for_log,
-            format_hex_preview(&payload.ciphertext),
-        );
-    } else {
-        println!(
-            "queued encrypted message id={message_id} from={} to={} queue_len={queue_len} expired_removed={expired_removed} ciphertext={}",
-            payload.from,
-            recipient_for_log,
-            format_hex_preview(&payload.ciphertext),
-        );
-    }
+    let _ = (live_delivery, queue_len, expired_removed);
+    state.accepted_messages.fetch_add(1, Ordering::Relaxed);
 
     Ok((
         StatusCode::ACCEPTED,
@@ -298,8 +289,8 @@ async fn read_messages(
         .collect();
     let delivered = unread.len();
     let expired_dropped = total_messages.saturating_sub(delivered);
-
-    println!("read recipient={recipient} delivered={delivered} expired_dropped={expired_dropped}");
+    let _ = (delivered, expired_dropped);
+    state.accepted_read_requests.fetch_add(1, Ordering::Relaxed);
 
     Ok(Json(ReadMessagesResponse { messages: unread }))
 }
@@ -315,7 +306,7 @@ async fn websocket_connect(
 }
 
 async fn websocket_session(mut socket: WebSocket, state: AppState, recipient: String) {
-    let auth = match receive_ws_auth(&mut socket, &recipient, &state).await {
+    match receive_ws_auth(&mut socket, &recipient, &state).await {
         Ok(auth) => auth,
         Err(message) => {
             let _ = send_ws_error(&mut socket, &message).await;
@@ -361,12 +352,7 @@ async fn websocket_session(mut socket: WebSocket, state: AppState, recipient: St
         cleanup_active_ws_connection(&state, &recipient, connection_id).await;
         return;
     }
-    let (delivered, expired_dropped) = delivered.unwrap();
-
-    println!(
-        "ws recipient={recipient} delivered={delivered} expired_dropped={expired_dropped} auth_nonce={}",
-        auth.nonce
-    );
+    let _ = delivered.unwrap();
 
     let mut ping_interval = interval(WS_PING_INTERVAL);
     loop {
@@ -462,15 +448,35 @@ fn spawn_cleanup_task(state: AppState) {
                 retain_unexpired_replay_entries(&mut cache)
             };
 
-            if expired_messages > 0
-                || expired_send_replays > 0
-                || expired_read_replays > 0
-                || expired_ws_open_replays > 0
-            {
-                println!(
-                    "cleanup removed expired_messages={expired_messages} expired_send_replays={expired_send_replays} expired_read_replays={expired_read_replays} expired_ws_open_replays={expired_ws_open_replays}"
-                );
+            let _ = (
+                expired_messages,
+                expired_send_replays,
+                expired_read_replays,
+                expired_ws_open_replays,
+            );
+        }
+    });
+}
+
+fn spawn_activity_log_task(state: AppState) {
+    tokio::spawn(async move {
+        let mut ticker = interval(ACTIVITY_LOG_INTERVAL);
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+
+            let messages = state.accepted_messages.swap(0, Ordering::Relaxed);
+            let read_requests = state.accepted_read_requests.swap(0, Ordering::Relaxed);
+
+            if messages == 0 && read_requests == 0 {
+                continue;
             }
+
+            println!(
+                "activity last_60s messages={} read_requests={}",
+                messages, read_requests
+            );
         }
     });
 }
@@ -888,16 +894,6 @@ fn now_unix_ms() -> Result<u64, ApiError> {
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
-}
-
-fn format_hex_preview(value: &str) -> String {
-    const MAX_PREVIEW: usize = 64;
-
-    if value.len() <= MAX_PREVIEW {
-        return value.to_owned();
-    }
-
-    format!("{}...", &value[..MAX_PREVIEW])
 }
 
 fn public_help_text() -> &'static str {
