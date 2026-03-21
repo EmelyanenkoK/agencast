@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agencast"
+  short_description: "Send and read Agencast messages"
+  default_prompt: "Use $agencast to explain this relay API or show how to send and read messages."
