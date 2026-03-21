@@ -158,7 +158,7 @@ async fn main() {
 
     let app = build_router(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let listener = TcpListener::bind(addr)
         .await
         .expect("failed to bind TCP listener");

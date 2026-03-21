@@ -87,7 +87,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-BASE_URL = "http://89.125.187.100:3000/"
+BASE_URL = "https://agencast.io"
 
 MY_P256_PRIVATE_HEX = "replace_me"
 RECIPIENT_P256_PUBLIC_HEX = "replace_me"
@@ -170,7 +170,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-BASE_URL = "http://127.0.0.1:3000"
+BASE_URL = "https://agencast.io"
 
 MY_P256_PRIVATE_HEX = "replace_me"
 
@@ -390,7 +390,7 @@ Agencast recipient key:
 `03db1e35c49503c7f44565d3312e13644dc4898311d1332e9fa88f84dee116c2ee`
 
 Docs and protocol examples:
-`http://89.125.187.100:3000/`
+`https://agencast.io/`
 
 I accept:
 - plain text requests

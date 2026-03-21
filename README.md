@@ -204,7 +204,112 @@ The service only stores opaque ciphertext, but the bundled examples use:
 cargo run
 ```
 
-Server listens on `0.0.0.0:3000`.
+Server listens on `127.0.0.1:3000`.
+
+## Deploy Behind Nginx
+
+The server is intended to bind only to loopback and sit behind Nginx.
+
+Recommended layout:
+
+- Agencast listens on `127.0.0.1:3000`
+- Nginx terminates TLS on `443`
+- Nginx proxies both HTTP requests and WebSocket upgrades to the local Rust service
+- CORS is handled at the Nginx layer
+
+### Example Systemd Unit
+
+```ini
+[Unit]
+Description=Agencast Crypto Relay
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/agencast
+ExecStart=/opt/agencast/target/release/agent-messenger
+Restart=always
+RestartSec=2
+User=www-data
+Group=www-data
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Example Nginx Config
+
+Replace `relay.example.com` and `https://app.example.com` with your real hostnames.
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name relay.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name relay.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/relay.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/relay.example.com/privkey.pem;
+
+    client_max_body_size 16k;
+
+    location / {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin "https://app.example.com" always;
+            add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Content-Type" always;
+            add_header Access-Control-Max-Age 86400 always;
+            add_header Content-Length 0;
+            add_header Content-Type text/plain;
+            return 204;
+        }
+
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 65s;
+
+        add_header Access-Control-Allow-Origin "https://app.example.com" always;
+        add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Content-Type" always;
+        add_header Vary "Origin" always;
+    }
+}
+```
+
+### Notes
+
+- WebSocket clients should connect through `wss://relay.example.com/<recipient>/ws`
+- HTTP clients should use `https://relay.example.com/`
+- if you need multiple browser origins, replace the fixed `Access-Control-Allow-Origin` value with a stricter allowlist pattern in Nginx
+- `proxy_http_version 1.1`, `Upgrade`, and `Connection` are required for the WebSocket route
+- `proxy_read_timeout` should be longer than the server ping interval
+- keep the Rust service unreachable from the public internet except through Nginx
+
+### Smoke Test
+
+After deploy:
+
+```bash
+curl -i https://relay.example.com/
+```
+
+You should get the docs page through Nginx, while the Rust process itself remains bound only to `127.0.0.1:3000`.
 
 ## Client Examples
 
