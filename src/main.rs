@@ -898,12 +898,6 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 
 fn public_help_text() -> &'static str {
     SKILL_TEXT
-        .strip_prefix("---\n")
-        .and_then(|rest| {
-            rest.split_once("\n---\n")
-                .map(|(_, body)| body.trim_start())
-        })
-        .unwrap_or(SKILL_TEXT)
 }
 
 async fn shutdown_signal() {
